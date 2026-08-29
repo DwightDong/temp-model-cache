@@ -273,35 +273,44 @@ class AppSettings: ObservableObject {
         profiles[index].anchorDisplayUUID = selectedDisplayUUID
     }
 
-    /// Finds a profile that should auto-activate for the given display UUID
-    /// Uses flexible matching to handle migration from old UUID-only format to new UUID+Serial format
-    func findAutoActivateProfile(forDisplayUUID uuid: String) -> DockProfile? {
-        // First try exact match
-        if let exactMatch = profiles.first(where: { $0.autoActivate && $0.anchorDisplayUUID == uuid }) {
-            return exactMatch
-        }
+    /// Migrates every persisted occurrence of a legacy display reference in one
+    /// transaction. Unavailable, ambiguous, and malformed values are left
+    /// untouched, and profile metadata/selection is not changed.
+    @discardableResult
+    func reconcileDisplayReferences(
+        using snapshot: DisplayReconciliationSnapshot
+    ) -> [String: String] {
+        let references = [selectedDisplayUUID] + profiles.map(\.anchorDisplayUUID)
+        let result = DisplayReferenceMigrator.migrate(references: references, using: snapshot)
 
-        // Try flexible matching - extract base UUID (before -SN or -V suffix)
-        let baseUUID = extractBaseUUID(from: uuid)
-
-        return profiles.first { profile in
-            guard profile.autoActivate else { return false }
-            let profileBaseUUID = extractBaseUUID(from: profile.anchorDisplayUUID)
-            return profileBaseUUID == baseUUID
+        let migratedSelected = result.references[0]
+        let migratedProfileReferences = Array(result.references.dropFirst())
+        if migratedProfileReferences != profiles.map(\.anchorDisplayUUID) {
+            var updatedProfiles = profiles
+            for index in updatedProfiles.indices {
+                updatedProfiles[index].anchorDisplayUUID = migratedProfileReferences[index]
+            }
+            profiles = updatedProfiles
         }
+        if migratedSelected != selectedDisplayUUID {
+            selectedDisplayUUID = migratedSelected
+        }
+        return result.migrations
     }
 
-    /// Extracts the base UUID portion from a fingerprint (removes -SN or -V suffixes)
-    private func extractBaseUUID(from fingerprint: String) -> String {
-        // Check for -SN suffix (serial number)
-        if let snRange = fingerprint.range(of: "-SN") {
-            return String(fingerprint[..<snRange.lowerBound])
-        }
-        // Check for -V suffix (vendor/model)
-        if let vRange = fingerprint.range(of: "-V") {
-            return String(fingerprint[..<vRange.lowerBound])
-        }
-        return fingerprint
+    /// Profile ordering is not identity evidence. If zero or multiple enabled
+    /// profiles resolve to the connected display, no profile is selected.
+    func findAutoActivateProfile(
+        forRuntimeDisplayID runtimeID: UInt64,
+        snapshot: DisplayReconciliationSnapshot
+    ) -> DockProfile? {
+        guard let index = DisplayProfileMatcher.uniqueMatch(
+            for: runtimeID,
+            references: profiles.map(\.anchorDisplayUUID),
+            enabled: profiles.map(\.autoActivate),
+            snapshot: snapshot
+        ) else { return nil }
+        return profiles[index]
     }
 
     // MARK: - Profile Persistence

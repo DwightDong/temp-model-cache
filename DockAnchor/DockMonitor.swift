@@ -13,76 +13,6 @@ import CoreGraphics
 import Combine
 import IOKit
 
-// MARK: - EDID Serial Number Extraction
-
-/// Extracts the physical serial number from a display's EDID data
-/// This provides rock-solid identification even when swapping ports or with identical monitors
-private func getDisplaySerialNumber(for displayID: CGDirectDisplayID) -> UInt32? {
-    // Get the vendor and product info from IOKit
-    var iterator: io_iterator_t = 0
-    let matching = IOServiceMatching("IODisplayConnect")
-
-    guard IOServiceGetMatchingServices(kIOMainPortDefault, matching, &iterator) == KERN_SUCCESS else {
-        return nil
-    }
-    defer { IOObjectRelease(iterator) }
-
-    while case let service = IOIteratorNext(iterator), service != 0 {
-        defer { IOObjectRelease(service) }
-
-        // Get the display info dictionary
-        if let info = IODisplayCreateInfoDictionary(service, IOOptionBits(kIODisplayOnlyPreferredName))?.takeRetainedValue() as? [String: Any] {
-            // Check if this is the right display by matching vendor/product
-            if let vendorID = info[kDisplayVendorID] as? Int,
-               let productID = info[kDisplayProductID] as? Int,
-               let serialNumber = info[kDisplaySerialNumber] as? Int {
-
-                // Verify this matches our display
-                let displayVendor = CGDisplayVendorNumber(displayID)
-                let displayProduct = CGDisplayModelNumber(displayID)
-                let displaySerial = CGDisplaySerialNumber(displayID)
-
-                if UInt32(vendorID) == displayVendor && UInt32(productID) == displayProduct {
-                    // Return EDID serial if available, otherwise display serial
-                    if serialNumber != 0 {
-                        return UInt32(serialNumber)
-                    } else if displaySerial != 0 {
-                        return displaySerial
-                    }
-                }
-            }
-        }
-    }
-
-    // Fallback: Try CGDisplaySerialNumber directly
-    let serial = CGDisplaySerialNumber(displayID)
-    return serial != 0 ? serial : nil
-}
-
-/// Creates a stable display fingerprint combining UUID and serial number
-private func createStableDisplayFingerprint(for displayID: CGDirectDisplayID) -> String {
-    // Get UUID
-    var uuidString = "DisplayID-\(displayID)"
-    if let uuid = CGDisplayCreateUUIDFromDisplayID(displayID) {
-        let uuidRef = uuid.takeRetainedValue()
-        uuidString = CFUUIDCreateString(nil, uuidRef) as String
-    }
-
-    // Get serial number for additional stability
-    if let serialNumber = getDisplaySerialNumber(for: displayID), serialNumber != 0 {
-        return "\(uuidString)-SN\(serialNumber)"
-    }
-
-    // Get vendor/model as additional fallback identifiers
-    let vendor = CGDisplayVendorNumber(displayID)
-    let model = CGDisplayModelNumber(displayID)
-    if vendor != 0 || model != 0 {
-        return "\(uuidString)-V\(vendor)M\(model)"
-    }
-
-    return uuidString
-}
-
 class DockMonitor: NSObject, ObservableObject {
     static let shared = DockMonitor()
 
@@ -91,6 +21,10 @@ class DockMonitor: NSObject, ObservableObject {
     @Published var statusMessage = "Dock Anchor Ready"
     @Published var availableDisplays: [DisplayInfo] = []
     @Published var needsPermissionReset = false
+    @Published private(set) var anchorIdentityState: AnchorIdentityState = .unavailable
+
+    private(set) var reconciliationSnapshot = DisplayReconciliationSnapshot.empty
+    private var identityRegistry = DockMonitor.loadIdentityRegistry()
 
     private var eventTap: CFMachPort?
     private var runLoopSource: CFRunLoopSource?
@@ -111,19 +45,31 @@ class DockMonitor: NSObject, ObservableObject {
     /// Magic value to identify our synthetic events (so we don't block our own events)
     private let syntheticEventMarker: Int64 = 0xD0C4A5C4 // "DOCKASCR" in hex-ish
     
+    enum AnchorIdentityState: String {
+        case unique
+        case unavailable
+        case ambiguous
+        case unresolved
+    }
+
     enum DockPosition {
         case bottom, left, right
     }
     
     struct DisplayInfo: Identifiable, Hashable {
         let id: CGDirectDisplayID
-        let uuid: String  // Stable fingerprint combining UUID + serial number
-        let serialNumber: UInt32?  // Physical serial number from EDID
+        /// A persistent reconciled identity when unique, otherwise the current
+        /// UUID/runtime reference used only for explicit selection.
+        let uuid: String
+        let serialNumber: UInt32?
         let frame: CGRect
         let name: String
         let isPrimary: Bool
+        let isBuiltIn: Bool
+        let identityResolution: DisplayPhysicalResolution
 
         func hash(into hasher: inout Hasher) {
+            hasher.combine(id)
             hasher.combine(uuid)
             hasher.combine(frame.origin.x)
             hasher.combine(frame.origin.y)
@@ -132,75 +78,51 @@ class DockMonitor: NSObject, ObservableObject {
         }
 
         static func == (lhs: DisplayInfo, rhs: DisplayInfo) -> Bool {
-            return lhs.uuid == rhs.uuid &&
-                   lhs.frame.origin.x == rhs.frame.origin.x &&
-                   lhs.frame.origin.y == rhs.frame.origin.y &&
-                   lhs.frame.size.width == rhs.frame.size.width &&
-                   lhs.frame.size.height == rhs.frame.size.height
+            lhs.id == rhs.id &&
+            lhs.uuid == rhs.uuid &&
+            lhs.frame == rhs.frame &&
+            lhs.name == rhs.name &&
+            lhs.identityResolution == rhs.identityResolution
         }
     }
 
-    /// Creates a stable display identifier combining UUID and physical serial number
-    /// This ensures rock-solid identification even when swapping ports or with identical monitors
-    private static func getDisplayUUID(for displayID: CGDirectDisplayID) -> String {
-        return createStableDisplayFingerprint(for: displayID)
-    }
-
-    /// Gets just the serial number for a display (for display in UI if needed)
-    private static func getSerialNumber(for displayID: CGDirectDisplayID) -> UInt32? {
-        return getDisplaySerialNumber(for: displayID)
-    }
-
-    /// Gets the display ID for a given UUID (public interface for AppSettings)
-    /// Uses flexible matching to handle migration from old UUID-only format to new UUID+Serial format
+    /// Resolves a persisted reference only when the snapshot has one physical
+    /// answer. An exact DisplayInfo match additionally permits an explicit
+    /// selection of an otherwise ambiguous display for this snapshot.
     func getDisplayID(forUUID uuid: String) -> CGDirectDisplayID? {
-        // First try exact match
-        if let exactMatch = availableDisplays.first(where: { $0.uuid == uuid }) {
-            return exactMatch.id
+        if let exact = availableDisplays.first(where: { $0.uuid == uuid }) {
+            return exact.id
         }
-        // Try flexible matching - extract base UUID
-        let baseUUID = extractBaseUUID(from: uuid)
-        return availableDisplays.first { extractBaseUUID(from: $0.uuid) == baseUUID }?.id
+        if case let .resolved(runtimeID, _) = reconciliationSnapshot.resolve(uuid) {
+            return CGDirectDisplayID(runtimeID)
+        }
+        return nil
     }
 
-    /// Gets the UUID for a given display ID (public interface for AppSettings)
     func getDisplayUUID(forID displayID: CGDirectDisplayID) -> String? {
-        return availableDisplays.first { $0.id == displayID }?.uuid
+        availableDisplays.first { $0.id == displayID }?.uuid
     }
 
-    /// Checks if a display with the given UUID is available (flexible matching)
+    func displayIdentityState(for reference: String) -> AnchorIdentityState {
+        switch reconciliationSnapshot.resolve(reference) {
+        case .resolved: return .unique
+        case .unavailable: return .unavailable
+        case .ambiguous: return .ambiguous
+        case .unresolved: return .unresolved
+        }
+    }
+
     func isDisplayAvailable(uuid: String) -> Bool {
-        // First try exact match
-        if availableDisplays.contains(where: { $0.uuid == uuid }) {
-            return true
-        }
-        // Try flexible matching
-        let baseUUID = extractBaseUUID(from: uuid)
-        return availableDisplays.contains { extractBaseUUID(from: $0.uuid) == baseUUID }
+        displayIdentityState(for: uuid) == .unique
     }
 
-    /// Gets the current UUID for a display that matches the given UUID (may have different suffix)
     func getCurrentUUID(matching uuid: String) -> String? {
-        // First try exact match
-        if let exactMatch = availableDisplays.first(where: { $0.uuid == uuid }) {
-            return exactMatch.uuid
+        if case let .resolved(_, canonicalReference) = reconciliationSnapshot.resolve(uuid) {
+            return canonicalReference
         }
-        // Try flexible matching
-        let baseUUID = extractBaseUUID(from: uuid)
-        return availableDisplays.first { extractBaseUUID(from: $0.uuid) == baseUUID }?.uuid
+        return nil
     }
 
-    /// Extracts the base UUID portion from a fingerprint (removes -SN or -V suffixes)
-    private func extractBaseUUID(from fingerprint: String) -> String {
-        if let snRange = fingerprint.range(of: "-SN") {
-            return String(fingerprint[..<snRange.lowerBound])
-        }
-        if let vRange = fingerprint.range(of: "-V") {
-            return String(fingerprint[..<vRange.lowerBound])
-        }
-        return fingerprint
-    }
-    
     override init() {
         super.init()
         setupInitialState()
@@ -208,8 +130,9 @@ class DockMonitor: NSObject, ObservableObject {
     }
     
     private func setupInitialState() {
-        // Initialize with main display UUID
-        anchorDisplayUUID = Self.getDisplayUUID(for: CGMainDisplayID())
+        // Initialize with a runtime observation; the first complete snapshot
+        // immediately replaces this with a reconciled effective identity.
+        anchorDisplayUUID = Self.getRawDisplayUUID(for: CGMainDisplayID())
         updateAvailableDisplays()
         detectCurrentDockPosition()
         setupDisplayConfigurationMonitoring()
@@ -240,12 +163,13 @@ class DockMonitor: NSObject, ObservableObject {
 
     /// Gets the UUID of the built-in display (if available)
     func getBuiltInDisplayUUID() -> String? {
-        return availableDisplays.first { $0.name.contains("Built-in") }?.uuid
+        availableDisplays.first { $0.isBuiltIn }?.uuid
     }
 
-    /// Gets the UUID of the main (primary) display
+    /// Gets the reconciled reference for the current main display.
     func getMainDisplayUUID() -> String {
-        return Self.getDisplayUUID(for: CGMainDisplayID())
+        availableDisplays.first { $0.id == CGMainDisplayID() }?.uuid
+            ?? Self.getRawDisplayUUID(for: CGMainDisplayID())
     }
 
     /// Gets the appropriate default anchor display UUID based on user settings
@@ -259,68 +183,67 @@ class DockMonitor: NSObject, ObservableObject {
         }
     }
 
-    /// Applies the default anchor display setting if no specific display is selected
+    /// Re-evaluates the effective fallback without modifying the preferred
+    /// anchor persisted by the user or active profile.
     private func applyDefaultAnchorIfNeeded() {
-        let defaultUUID = getDefaultAnchorDisplayUUID()
-        if anchorDisplayUUID != defaultUUID {
-            anchorDisplayUUID = defaultUUID
-            updateAnchoredDisplayName()
-            AppSettings.shared.selectedDisplayUUID = defaultUUID
-        }
+        validateCurrentAnchorDisplay()
+        updateAnchoredDisplayName()
     }
-    
+
     func updateAvailableDisplays() {
         let newDisplays = getAllDisplays()
-
-        // Update the displays array
         availableDisplays = newDisplays
 
-        // Re-detect dock position in case the user changed dock orientation
         detectCurrentDockPosition()
         validateCurrentAnchorDisplay()
         updateAnchoredDisplayName()
 
-        // Notify on main queue to ensure UI updates
         DispatchQueue.main.async {
             self.objectWillChange.send()
             NotificationCenter.default.post(name: .displaysDidChange, object: nil)
         }
     }
-    
+
     private func validateCurrentAnchorDisplay() {
-        // If there's only one display, always select it
-        if availableDisplays.count == 1, let onlyDisplay = availableDisplays.first {
-            if anchorDisplayUUID != onlyDisplay.uuid {
-                anchorDisplayUUID = onlyDisplay.uuid
-                AppSettings.shared.selectedDisplayUUID = onlyDisplay.uuid
-            }
+        let fallbackReference = getDefaultAnchorDisplayUUID()
+        let fallbackRuntimeID = availableDisplays.first { $0.uuid == fallbackReference }
+            .map { UInt64($0.id) }
+        let decision = DisplayAnchorResolver.resolve(
+            preferredReference: AppSettings.shared.selectedDisplayUUID,
+            fallbackRuntimeID: fallbackRuntimeID,
+            snapshot: reconciliationSnapshot
+        )
+
+        if !decision.usesFallback,
+           let runtimeID = decision.effectiveRuntimeID,
+           let display = availableDisplays.first(where: { $0.id == CGDirectDisplayID(runtimeID) }) {
+            anchorDisplayUUID = display.uuid
+            anchorIdentityState = .unique
             return
         }
 
-        // Check if the current anchor display is still available (using flexible matching)
-        let isAnchorDisplayAvailable = isDisplayAvailable(uuid: anchorDisplayUUID)
+        switch decision.preferredResolution {
+        case .ambiguous: useConfiguredFallback(state: .ambiguous)
+        case .unavailable: useConfiguredFallback(state: .unavailable)
+        case .unresolved: useConfiguredFallback(state: .unresolved)
+        case .resolved: useConfiguredFallback(state: .unavailable)
+        }
+    }
 
-        if !isAnchorDisplayAvailable {
-            // Anchor display is no longer available, temporarily switch to default anchor display
-            // but DON'T update AppSettings - we preserve user's preference for reconnection
-            let defaultUUID = getDefaultAnchorDisplayUUID()
-            anchorDisplayUUID = defaultUUID
-            let defaultName = AppSettings.shared.defaultAnchorDisplay == .builtIn ? "Built-in" : "Primary"
+    private func useConfiguredFallback(state: AnchorIdentityState) {
+        anchorIdentityState = state
+        anchorDisplayUUID = getDefaultAnchorDisplayUUID()
+        updateAnchoredDisplayName()
+        let defaultName = AppSettings.shared.defaultAnchorDisplay == .builtIn ? "Built-in" : "Primary"
+        switch state {
+        case .ambiguous:
+            statusMessage = "Ambiguous display identity - temporarily using \(defaultName)"
+        case .unavailable:
             statusMessage = "Anchor display unavailable - temporarily using \(defaultName)"
-
-            // Reset status message after 3 seconds
-            DispatchQueue.main.asyncAfter(deadline: .now() + 3.0) { [weak self] in
-                guard let self = self else { return }
-                if self.isActive {
-                    self.statusMessage = "Dock Anchor Active - Monitoring mouse movement"
-                } else {
-                    self.statusMessage = "Dock Anchor Ready"
-                }
-            }
-        } else if let currentUUID = getCurrentUUID(matching: anchorDisplayUUID),
-                  currentUUID != anchorDisplayUUID {
-            // Display is available but fingerprint may have been updated (e.g., serial number now available)
-            anchorDisplayUUID = currentUUID
+        case .unresolved:
+            statusMessage = "Anchor display reference unresolved - temporarily using \(defaultName)"
+        case .unique:
+            break
         }
     }
 
@@ -330,28 +253,28 @@ class DockMonitor: NSObject, ObservableObject {
         }
     }
 
-    /// Change anchor display by UUID (preferred method for stable identification)
+    /// Changes the effective display. Exact current-snapshot values permit an
+    /// explicit temporary choice even if physical identity is ambiguous. The
+    /// persisted preference is never rewritten to a fallback here.
     func changeAnchorDisplay(toUUID uuid: String) {
-        // Validate that the requested display is available
-        let isDisplayAvailable = availableDisplays.contains { $0.uuid == uuid }
-
-        if isDisplayAvailable {
-            anchorDisplayUUID = uuid
+        if let exact = availableDisplays.first(where: { $0.uuid == uuid }) {
+            anchorDisplayUUID = exact.uuid
+            anchorIdentityState = exact.identityResolution == .unique ? .unique : .ambiguous
+            updateAnchoredDisplayName()
+            statusMessage = exact.identityResolution == .unique
+                ? "Anchor changed to \(anchoredDisplay)"
+                : "Anchor changed to \(anchoredDisplay) (physical identity ambiguous)"
+        } else if case let .resolved(runtimeID, _) = reconciliationSnapshot.resolve(uuid),
+                  let display = availableDisplays.first(where: { $0.id == CGDirectDisplayID(runtimeID) }) {
+            anchorDisplayUUID = display.uuid
+            anchorIdentityState = .unique
             updateAnchoredDisplayName()
             statusMessage = "Anchor changed to \(anchoredDisplay)"
         } else {
-            // Requested display is not available, use default anchor display instead
-            let defaultUUID = getDefaultAnchorDisplayUUID()
-            anchorDisplayUUID = defaultUUID
-            updateAnchoredDisplayName()
-            let defaultName = AppSettings.shared.defaultAnchorDisplay == .builtIn ? "Built-in" : "Primary"
-            statusMessage = "Requested display not available - using \(defaultName)"
-
-            // Update the settings to reflect the actual change
-            NotificationCenter.default.post(name: .anchorDisplayChanged, object: defaultUUID)
+            let state = displayIdentityState(for: uuid)
+            useConfiguredFallback(state: state)
         }
-        
-        // Reset status message after 3 seconds
+
         DispatchQueue.main.asyncAfter(deadline: .now() + 3.0) { [weak self] in
             guard let self = self else { return }
             if self.isActive {
@@ -362,9 +285,8 @@ class DockMonitor: NSObject, ObservableObject {
         }
     }
 
-    /// Change anchor display by display ID (convenience method - converts to UUID internally)
     func changeAnchorDisplay(to displayID: CGDirectDisplayID) {
-        let uuid = Self.getDisplayUUID(for: displayID)
+        guard let uuid = getDisplayUUID(forID: displayID) else { return }
         changeAnchorDisplay(toUUID: uuid)
     }
 
@@ -583,6 +505,10 @@ class DockMonitor: NSObject, ObservableObject {
 
     /// Moves the dock to the anchored display by simulating mouse movement to the dock trigger zone
     func relocateDockToAnchoredDisplay() {
+        guard anchorIdentityState != .ambiguous else {
+            statusMessage = "Cannot relocate dock - display identity is ambiguous"
+            return
+        }
         guard let anchorDisplay = availableDisplays.first(where: { $0.id == anchorDisplayID }) else {
             statusMessage = "Cannot relocate dock - anchor display not found"
             return
@@ -868,351 +794,309 @@ class DockMonitor: NSObject, ObservableObject {
         }
     }
     
+    private static let identityRegistryDefaultsKey = "displayIdentityRegistryV2"
+
+    private static func getRawDisplayUUID(for displayID: CGDirectDisplayID) -> String {
+        if let uuid = CGDisplayCreateUUIDFromDisplayID(displayID) {
+            return CFUUIDCreateString(nil, uuid.takeRetainedValue()) as String
+        }
+        return "DisplayID-\(displayID)"
+    }
+
+    private static func loadIdentityRegistry() -> DisplayIdentityRegistry {
+        guard let data = UserDefaults.standard.data(forKey: identityRegistryDefaultsKey),
+              let registry = try? JSONDecoder().decode(DisplayIdentityRegistry.self, from: data) else {
+            return DisplayIdentityRegistry()
+        }
+        return registry
+    }
+
+    private func saveIdentityRegistry() {
+        guard let data = try? JSONEncoder().encode(identityRegistry) else { return }
+        UserDefaults.standard.set(data, forKey: Self.identityRegistryDefaultsKey)
+    }
+
+    /// Builds all source observations first, then reconciles them once. Every
+    /// display consumer uses the resulting snapshot rather than repeating a
+    /// local first-match lookup.
     private func getAllDisplays() -> [DisplayInfo] {
-        var displays: [DisplayInfo] = []
-        
         let maxDisplays: UInt32 = 16
         var displayIDs = [CGDirectDisplayID](repeating: 0, count: Int(maxDisplays))
         var displayCount: UInt32 = 0
-        
-        let result = CGGetActiveDisplayList(maxDisplays, &displayIDs, &displayCount)
-        
-        guard result == .success else { return displays }
-        
-        // Get system display information once
-        let systemDisplays = getSystemDisplaysInfo()
-        let mainDisplayID = CGMainDisplayID()
-        
-        for i in 0..<Int(displayCount) {
-            let displayID = displayIDs[i]
-            let uuid = Self.getDisplayUUID(for: displayID)
-            let serialNumber = Self.getSerialNumber(for: displayID)
-            let frame = CGDisplayBounds(displayID)
-            let name = getDisplayName(for: displayID, systemDisplays: systemDisplays)
-            let isPrimary = displayID == mainDisplayID
+        guard CGGetActiveDisplayList(maxDisplays, &displayIDs, &displayCount) == .success else {
+            return []
+        }
 
-            displays.append(DisplayInfo(id: displayID, uuid: uuid, serialNumber: serialNumber, frame: frame, name: name, isPrimary: isPrimary))
+        displayIDs = Array(displayIDs.prefix(Int(displayCount))).filter {
+            let bounds = CGDisplayBounds($0)
+            return bounds.width > 0 && bounds.height > 0
         }
-        
-        // Sort so primary display is first
-        displays.sort { display1, display2 in
-            if display1.isPrimary && !display2.isPrimary { return true }
-            if !display1.isPrimary && display2.isPrimary { return false }
-            return display1.frame.minX < display2.frame.minX
+
+        let runtimes = displayIDs.map { displayID in
+            DisplayRuntimeObservation(
+                runtimeID: UInt64(displayID),
+                uuidAlias: Self.getRawDisplayUUID(for: displayID),
+                vendorID: CGDisplayVendorNumber(displayID),
+                productID: CGDisplayModelNumber(displayID),
+                serialNumber: CGDisplaySerialNumber(displayID) == 0
+                    ? nil
+                    : CGDisplaySerialNumber(displayID),
+                isBuiltIn: CGDisplayIsBuiltin(displayID) != 0
+            )
         }
-        
+        let metadata = getIOKitDisplayMetadata() + getSystemProfilerDisplayMetadata()
+        var snapshot = DisplayReconciler.reconcile(
+            runtimes: runtimes,
+            metadata: metadata,
+            priorRegistry: identityRegistry
+        )
+
+        // Migrate every occurrence of a value together. Ambiguous/unavailable
+        // values remain byte-for-byte unchanged.
+        let migrations = AppSettings.shared.reconcileDisplayReferences(using: snapshot)
+        identityRegistry = snapshot.registry.recordingLegacyReferences(migrations)
+        snapshot = snapshot.withRegistry(identityRegistry)
+        reconciliationSnapshot = snapshot
+        saveIdentityRegistry()
+
+        let rawAliases = Dictionary(grouping: runtimes.compactMap { $0.uuidAlias }, by: { $0 })
+            .mapValues(\.count)
+        let frames = Dictionary(uniqueKeysWithValues: displayIDs.map { ($0, CGDisplayBounds($0)) })
+        let mainDisplayID = CGMainDisplayID()
+
+        var displays = snapshot.displays.map { reconciled -> DisplayInfo in
+            let displayID = CGDirectDisplayID(reconciled.runtime.runtimeID)
+            let frame = frames[displayID] ?? .zero
+            let isPrimary = displayID == mainDisplayID
+            let explicitReference: String
+            if reconciled.resolution == .unique, let persistent = reconciled.persistentReference {
+                explicitReference = persistent
+            } else if let alias = reconciled.runtime.uuidAlias,
+                      rawAliases[alias] == 1 {
+                explicitReference = alias
+            } else {
+                explicitReference = "DisplayID-\(displayID)"
+            }
+
+            let baseName = reconciled.friendlyName
+                ?? fallbackDisplayName(for: displayID, frame: frame, mainDisplayID: mainDisplayID)
+            let name = isPrimary && !baseName.contains("(Primary)")
+                ? "\(baseName) (Primary)"
+                : baseName
+            return DisplayInfo(
+                id: displayID,
+                uuid: explicitReference,
+                serialNumber: reconciled.identity?.serialNumber,
+                frame: frame,
+                name: name,
+                isPrimary: isPrimary,
+                isBuiltIn: reconciled.isBuiltIn,
+                identityResolution: reconciled.resolution
+            )
+        }
+
+        // This ordering is presentation only and never participates in identity
+        // assignment.
+        displays.sort { lhs, rhs in
+            if lhs.isPrimary != rhs.isPrimary { return lhs.isPrimary }
+            if lhs.frame.minX != rhs.frame.minX { return lhs.frame.minX < rhs.frame.minX }
+            return lhs.frame.minY < rhs.frame.minY
+        }
         return displays
     }
-    
-    private func getSystemDisplaysInfo() -> [(name: String, info: [String: String])] {
+
+    private func getIOKitDisplayMetadata() -> [DisplayMetadataObservation] {
+        var iterator: io_iterator_t = 0
+        guard IOServiceGetMatchingServices(
+            kIOMainPortDefault,
+            IOServiceMatching("IODisplayConnect"),
+            &iterator
+        ) == KERN_SUCCESS else { return [] }
+        defer { IOObjectRelease(iterator) }
+
+        var observations: [DisplayMetadataObservation] = []
+        while case let service = IOIteratorNext(iterator), service != 0 {
+            defer { IOObjectRelease(service) }
+            guard let info = IODisplayCreateInfoDictionary(
+                service,
+                IOOptionBits(kIODisplayOnlyPreferredName)
+            )?.takeRetainedValue() as? [String: Any] else { continue }
+
+            var registryID: UInt64 = 0
+            IORegistryEntryGetRegistryEntryID(service, &registryID)
+            let vendor = uint32Value(info[kDisplayVendorID]) ?? 0
+            let product = uint32Value(info[kDisplayProductID]) ?? 0
+            let serial = uint32Value(info[kDisplaySerialNumber]).flatMap { $0 == 0 ? nil : $0 }
+            let uuidAlias = stringValue(
+                info["DisplayUUID"] ?? info["IODisplayUUID"] ?? info["UUID"]
+            )
+            let name = localizedProductName(info[kDisplayProductName])
+
+            observations.append(DisplayMetadataObservation(
+                source: "iokit",
+                sourceID: "iokit-\(registryID)",
+                uuidAlias: uuidAlias,
+                vendorID: vendor,
+                productID: product,
+                serialNumber: serial,
+                name: name,
+                presentationPriority: 50
+            ))
+        }
+        return observations
+    }
+
+    private func getSystemProfilerDisplayMetadata() -> [DisplayMetadataObservation] {
         let task = Process()
-        task.launchPath = "/usr/sbin/system_profiler"
-        task.arguments = ["SPDisplaysDataType"]
-        
+        task.executableURL = URL(fileURLWithPath: "/usr/sbin/system_profiler")
+        task.arguments = ["-json", "SPDisplaysDataType"]
         let pipe = Pipe()
         task.standardOutput = pipe
-        
+
         do {
             try task.run()
             task.waitUntilExit()
-            
             let data = pipe.fileHandleForReading.readDataToEndOfFile()
-            let output = String(data: data, encoding: .utf8) ?? ""
-            
-            // Parse the output to find display names
-            let lines = output.components(separatedBy: .newlines)
-            var displays: [(name: String, info: [String: String])] = []
-            var currentDisplayName: String?
-            var currentDisplayInfo: [String: String] = [:]
-            
-            for line in lines {
-                let trimmedLine = line.trimmingCharacters(in: .whitespaces)
-                
-                // Look for display names (lines ending with ":" that are indented)
-                if trimmedLine.hasSuffix(":") && line.hasPrefix("        ") && !line.hasPrefix("          ") {
-                    let displayName = String(trimmedLine.dropLast()) // Remove the ":"
-                    
-                    // Save the previous display if we have one
-                    if let prevDisplayName = currentDisplayName {
-                        displays.append((name: prevDisplayName, info: currentDisplayInfo))
-                    }
-                    
-                    // Start new display
-                    currentDisplayName = displayName
-                    currentDisplayInfo = [:]
-                }
-                
-                // Collect display properties
-                if line.hasPrefix("          ") && currentDisplayName != nil {
-                    let propertyLine = line.trimmingCharacters(in: .whitespaces)
-                    if propertyLine.contains(":") {
-                        let components = propertyLine.components(separatedBy: ":")
-                        if components.count >= 2 {
-                            let key = components[0].trimmingCharacters(in: .whitespaces)
-                            let value = components[1].trimmingCharacters(in: .whitespaces)
-                            currentDisplayInfo[key] = value
-                        }
-                    }
-                }
-            }
-            
-            // Add the last display
-            if let lastDisplayName = currentDisplayName {
-                displays.append((name: lastDisplayName, info: currentDisplayInfo))
+            guard task.terminationStatus == 0,
+                  let root = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  let adapters = root["SPDisplaysDataType"] as? [[String: Any]] else {
+                return []
             }
 
-            return displays
+            var rawRecords: [(baseID: String, observation: DisplayMetadataObservation)] = []
+            for adapter in adapters {
+                guard let displays = adapter["spdisplays_ndrvs"] as? [[String: Any]] else { continue }
+                for display in displays {
+                    let name = stringValue(display["_name"])
+                    let vendor = profilerUInt32(
+                        display["_spdisplays_display-vendor-id"] ?? display["spdisplays_vendor-id"],
+                        hexadecimalByDefault: true
+                    ) ?? 0
+                    let product = profilerUInt32(
+                        display["_spdisplays_display-product-id"] ?? display["spdisplays_product-id"],
+                        hexadecimalByDefault: true
+                    ) ?? 0
+                    let serial = profilerUInt32(
+                        display["_spdisplays_display-serial-number"]
+                            ?? display["_spdisplays_display-serial-number2"]
+                            ?? display["spdisplays_display-serial-number"],
+                        hexadecimalByDefault: false
+                    ).flatMap { $0 == 0 ? nil : $0 }
+                    let uuidAlias = stringValue(
+                        display["_spdisplays_display-uuid"] ?? display["spdisplays_display-uuid"]
+                    )
+                    let type = stringValue(display["spdisplays_display_type"])
+                        ?? stringValue(display["_spdisplays_display-type"])
+                    let isBuiltIn = type.map {
+                        $0.localizedCaseInsensitiveContains("built-in") ||
+                        $0.localizedCaseInsensitiveContains("internal")
+                    }
+                    let resolution = stringValue(display["_spdisplays_resolution"])
+                        ?? stringValue(display["spdisplays_resolution"])
+                    let baseID = [
+                        uuidAlias ?? "", String(vendor), String(product), String(serial ?? 0),
+                        name ?? "", type ?? "", resolution ?? ""
+                    ].joined(separator: "|")
+                    rawRecords.append((
+                        baseID: baseID,
+                        observation: DisplayMetadataObservation(
+                            source: "system_profiler",
+                            sourceID: baseID,
+                            uuidAlias: uuidAlias,
+                            vendorID: vendor,
+                            productID: product,
+                            serialNumber: serial,
+                            name: name,
+                            isBuiltIn: isBuiltIn,
+                            presentationPriority: 100
+                        )
+                    ))
+                }
+            }
 
+            // Stable occurrence suffixes avoid depending on profiler array order.
+            var occurrences: [String: Int] = [:]
+            return rawRecords.sorted { $0.baseID < $1.baseID }.map { item in
+                let occurrence = occurrences[item.baseID, default: 0]
+                occurrences[item.baseID] = occurrence + 1
+                let record = item.observation
+                return DisplayMetadataObservation(
+                    source: record.source,
+                    sourceID: "profiler-\(item.baseID)#\(occurrence)",
+                    uuidAlias: record.uuidAlias,
+                    vendorID: record.vendorID,
+                    productID: record.productID,
+                    serialNumber: record.serialNumber,
+                    name: record.name,
+                    isBuiltIn: record.isBuiltIn,
+                    presentationPriority: record.presentationPriority
+                )
+            }
         } catch {
             return []
         }
     }
-    
-    private func getDisplayName(for displayID: CGDirectDisplayID, systemDisplays: [(name: String, info: [String: String])]) -> String {
-        let mainDisplayID = CGMainDisplayID()
-        
-        // Get the actual display name from the system
-        if let displayName = findBestDisplayMatch(displayID: displayID, displays: systemDisplays) {
-            let isPrimary = displayID == mainDisplayID
-            return isPrimary ? "\(displayName) (Primary)" : displayName
-        }
-        
-        // Fallback to generic names if we can't get the system name
-        if displayID == mainDisplayID {
-            return "Primary Display"
-        } else {
-            // Try to get a more descriptive name based on position
-            let frame = CGDisplayBounds(displayID)
-            let mainFrame = CGDisplayBounds(mainDisplayID)
-            
-            if frame.minX > mainFrame.maxX {
-                return "Right Display"
-            } else if frame.maxX < mainFrame.minX {
-                return "Left Display"
-            } else if frame.minY > mainFrame.maxY {
-                return "Bottom Display"
-            } else if frame.maxY < mainFrame.minY {
-                return "Top Display"
-            } else {
-                return "Secondary Display"
-            }
-        }
+
+    private func fallbackDisplayName(
+        for displayID: CGDirectDisplayID,
+        frame: CGRect,
+        mainDisplayID: CGDirectDisplayID
+    ) -> String {
+        if CGDisplayIsBuiltin(displayID) != 0 { return "Built-in Display" }
+        if displayID == mainDisplayID { return "Primary Display" }
+
+        let mainFrame = CGDisplayBounds(mainDisplayID)
+        if frame.minX >= mainFrame.maxX { return "Right Display" }
+        if frame.maxX <= mainFrame.minX { return "Left Display" }
+        if frame.minY >= mainFrame.maxY { return "Bottom Display" }
+        if frame.maxY <= mainFrame.minY { return "Top Display" }
+        return "Secondary Display"
     }
-    
 
-    
-    private func findBestDisplayMatch(displayID: CGDirectDisplayID, displays: [(name: String, info: [String: String])]) -> String? {
-        let frame = CGDisplayBounds(displayID)
-        let actualResolution = "\(Int(frame.width)) x \(Int(frame.height))"
-        let mainDisplayID = CGMainDisplayID()
-        let isMainDisplay = displayID == mainDisplayID
-
-        // First priority: Check for Virtual Device/AirPlay for Sidecar displays WITH resolution match
-        for display in displays {
-            // Check if this is a Sidecar display by name first AND resolution matches
-            if display.name.contains("Sidecar") {
-                if resolution_matches_exactly(actualResolution, display.info["Resolution"]) ||
-                   resolution_matches_approximately(actualResolution, display.info["Resolution"]) {
-                    return "Sidecar"
-                }
-            }
-
-            // Only check for Virtual Device + AirPlay combination for Sidecar WITH resolution match
-            if let virtualDevice = display.info["Virtual Device"], virtualDevice.contains("Yes"),
-               let connectionType = display.info["Connection Type"], connectionType.contains("AirPlay") {
-                if resolution_matches_exactly(actualResolution, display.info["Resolution"]) ||
-                   resolution_matches_approximately(actualResolution, display.info["Resolution"]) {
-                    return "Sidecar"
-                }
-            }
+    private func localizedProductName(_ value: Any?) -> String? {
+        if let names = value as? [String: String] {
+            return names["en_US"]
+                ?? names["en"]
+                ?? names.keys.sorted().compactMap { names[$0] }.first
         }
-
-        // Second priority: Check for Built-in displays by Display Type or Connection Type
-        for display in displays {
-            if let displayType = display.info["Display Type"], displayType.contains("Built-in") {
-                if resolution_matches_exactly(actualResolution, display.info["Resolution"]) {
-                    return display.name.contains("Color LCD") ? "Built-in Display" : display.name
-                }
-            }
-            if let connectionType = display.info["Connection Type"], connectionType.contains("Internal") {
-                if resolution_matches_exactly(actualResolution, display.info["Resolution"]) {
-                    return display.name.contains("Color LCD") ? "Built-in Display" : display.name
-                }
-            }
+        if let names = value as? [String: Any] {
+            return names.keys.sorted().compactMap { stringValue(names[$0]) }.first
         }
+        return stringValue(value)
+    }
 
-        // Third priority: Check for external displays with exact resolution match
-        for display in displays {
-            if let resolution = display.info["Resolution"] {
-                if resolution_matches_exactly(actualResolution, resolution) {
-                    // Skip displays we've already handled
-                    if let connectionType = display.info["Connection Type"] {
-                        if connectionType.contains("Internal") || connectionType.contains("AirPlay") {
-                            continue
-                        }
-                    }
-                    if let virtualDevice = display.info["Virtual Device"], virtualDevice.contains("Yes") {
-                        continue
-                    }
-                    return display.name
-                }
-            }
-        }
-
-        // Fourth priority: Check by Main Display flag with resolution confirmation
-        if isMainDisplay {
-            for display in displays {
-                if let mainDisplayFlag = display.info["Main Display"], mainDisplayFlag.contains("Yes") {
-                    if let resolution = display.info["Resolution"], resolution_matches_exactly(actualResolution, resolution) {
-                        return display.name.contains("Color LCD") ? "Built-in Display" : display.name
-                    }
-                }
-            }
-        }
-
-        // Fifth priority: Approximate resolution matching as fallback
-        for display in displays {
-            if let resolution = display.info["Resolution"] {
-                if resolution_matches_approximately(actualResolution, resolution) {
-                    if display.name.contains("Color LCD") || display.name.contains("Built-in") {
-                        return "Built-in Display"
-                    } else if display.name.contains("Sidecar") {
-                        return "Sidecar"
-                    } else {
-                        return display.name
-                    }
-                }
-            }
-        }
-
+    private func stringValue(_ value: Any?) -> String? {
+        if let value = value as? String, !value.isEmpty { return value }
+        if let value = value as? NSString, value.length > 0 { return value as String }
         return nil
     }
-    
-    private func resolution_matches_exactly(_ actual: String, _ reported: String?) -> Bool {
-        guard let reported = reported else { return false }
-        
-        // Extract width and height from actual resolution (e.g., "3840 x 1600")
-        let actualComponents = actual.components(separatedBy: " x ")
-        guard actualComponents.count == 2,
-              let actualWidth = Int(actualComponents[0]),
-              let actualHeight = Int(actualComponents[1]) else {
-            return false
-        }
-        
-        // Extract width and height from reported resolution (e.g., "3840 x 1600 (Ultra-wide 4K)")
-        let reportedNumbers = reported.components(separatedBy: CharacterSet.decimalDigits.inverted).filter { !$0.isEmpty }
-        guard reportedNumbers.count >= 2,
-              let reportedWidth = Int(reportedNumbers[0]),
-              let reportedHeight = Int(reportedNumbers[1]) else {
-            return false
-        }
-        
-        // Check exact match
-        if actualWidth == reportedWidth && actualHeight == reportedHeight {
-            return true
-        }
 
-        // Check for common scaling scenarios (e.g., Retina displays)
-        // For Retina displays, the actual resolution is often scaled
-        if (actualWidth == reportedWidth / 2 && actualHeight == reportedHeight / 2) ||
-           (actualWidth * 2 == reportedWidth && actualHeight * 2 == reportedHeight) {
-            return true
-        }
-
-        // For some Retina displays, the scaling might be different
-        // Check if the aspect ratio matches and if one is a reasonable scale of the other
-        let actualAspectRatio = Double(actualWidth) / Double(actualHeight)
-        let reportedAspectRatio = Double(reportedWidth) / Double(reportedHeight)
-
-        // If aspect ratios are close (within 5% tolerance) and one is a scale of the other
-        if abs(actualAspectRatio - reportedAspectRatio) < 0.05 {
-            let scaleX = Double(reportedWidth) / Double(actualWidth)
-            let scaleY = Double(reportedHeight) / Double(actualHeight)
-
-            // Check if both scales are similar (within 10% tolerance) and reasonable (between 1.2 and 3.0)
-            if abs(scaleX - scaleY) < 0.1 && scaleX > 1.2 && scaleX < 3.0 {
-                return true
-            }
-        }
-        
-        return false
+    private func uint32Value(_ value: Any?) -> UInt32? {
+        if let value = value as? UInt32 { return value }
+        if let value = value as? UInt64, value <= UInt64(UInt32.max) { return UInt32(value) }
+        if let value = value as? Int, value >= 0, value <= Int(UInt32.max) { return UInt32(value) }
+        if let value = value as? NSNumber { return value.uint32Value }
+        if let value = stringValue(value) { return UInt32(value) }
+        return nil
     }
-    
-    private func resolution_matches_approximately(_ actual: String, _ reported: String?) -> Bool {
-        guard let reported = reported else { return false }
-        
-        // Extract numbers from resolution strings
-        let actualComponents = actual.components(separatedBy: " x ")
-        let reportedNumbers = reported.components(separatedBy: CharacterSet.decimalDigits.inverted).filter { !$0.isEmpty }
-        
-        if actualComponents.count == 2 && reportedNumbers.count >= 2 {
-            let actualWidth = Int(actualComponents[0]) ?? 0
-            let actualHeight = Int(actualComponents[1]) ?? 0
-            let reportedWidth = Int(reportedNumbers[0]) ?? 0
-            let reportedHeight = Int(reportedNumbers[1]) ?? 0
-            
-            return actualWidth == reportedWidth && actualHeight == reportedHeight
+
+    private func profilerUInt32(_ value: Any?, hexadecimalByDefault: Bool) -> UInt32? {
+        if !(value is String) && !(value is NSString) { return uint32Value(value) }
+        guard var text = stringValue(value)?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !text.isEmpty else { return nil }
+        text = text.lowercased()
+        if text.hasPrefix("0x") { return UInt32(text.dropFirst(2), radix: 16) }
+        if text.allSatisfy({ $0.isNumber }) {
+            return UInt32(text, radix: hexadecimalByDefault ? 16 : 10)
         }
-        
-        return false
+        if text.allSatisfy({ $0.isHexDigit }) { return UInt32(text, radix: 16) }
+        return nil
     }
-    
+
     func refreshDisplays() {
-        let maxDisplays: UInt32 = 16
-        var displayIDs = [CGDirectDisplayID](repeating: 0, count: Int(maxDisplays))
-        var displayCount: UInt32 = 0
-        
-        let result = CGGetActiveDisplayList(maxDisplays, &displayIDs, &displayCount)
-        
-        guard result == .success else {
-            return
-        }
-        
-        // Get system display information once
-        let systemDisplays = getSystemDisplaysInfo()
-        
-        var newDisplays: [DisplayInfo] = []
-        
-        for i in 0..<displayCount {
-            let displayID = displayIDs[Int(i)]
-            let frame = CGDisplayBounds(displayID)
-
-            // Skip displays with zero size
-            if frame.width == 0 || frame.height == 0 {
-                continue
-            }
-
-            let uuid = Self.getDisplayUUID(for: displayID)
-            let serialNumber = Self.getSerialNumber(for: displayID)
-            let name = getDisplayName(for: displayID, systemDisplays: systemDisplays)
-            let isPrimary = displayID == CGMainDisplayID()
-
-            newDisplays.append(DisplayInfo(
-                id: displayID,
-                uuid: uuid,
-                serialNumber: serialNumber,
-                frame: frame,
-                name: name,
-                isPrimary: isPrimary
-            ))
-        }
-        
-        // Sort displays: primary first, then by position
-        newDisplays.sort { display1, display2 in
-            if display1.isPrimary { return true }
-            if display2.isPrimary { return false }
-            return display1.frame.minX < display2.frame.minX
-        }
-        
-        DispatchQueue.main.async {
-            self.availableDisplays = newDisplays
-            
-            // Update current anchor display and validate it's still correct
-            self.validateCurrentAnchorDisplay()
-            self.updateAnchoredDisplayName()
-        }
+        updateAvailableDisplays()
     }
-    
+
     private func updateCurrentAnchorDisplay() {
         // Get the current dock position and determine which display it's on
         let dockPosition = getCurrentDockPosition()
@@ -1285,27 +1169,29 @@ class DockMonitor: NSObject, ObservableObject {
         }, Unmanaged.passUnretained(self).toOpaque())
     }
     
-    private func handleDisplayConfigurationChange(displayID: CGDirectDisplayID, flags: CGDisplayChangeSummaryFlags) {
-        // Handle display configuration changes
+    private func handleDisplayConfigurationChange(
+        displayID: CGDirectDisplayID,
+        flags: CGDisplayChangeSummaryFlags
+    ) {
         DispatchQueue.main.async { [weak self] in
             guard let self = self else { return }
 
             if flags.contains(.addFlag) {
-                self.statusMessage = "New display detected - updating available displays"
+                self.statusMessage = "New display detected - reconciling display identities"
                 self.updateAvailableDisplays()
 
-                // Get the UUID of the specific display that was just connected
-                let connectedDisplayUUID = Self.getDisplayUUID(for: displayID)
-
-                // Check for profile auto-activation for the specific newly connected display
+                let connectedRuntimeID = UInt64(displayID)
+                let connectedDisplay = self.reconciliationSnapshot.display(runtimeID: connectedRuntimeID)
+                let connectedIsUnique = connectedDisplay?.resolution == .unique
                 var profileActivated = false
-                if let profile = AppSettings.shared.findAutoActivateProfile(forDisplayUUID: connectedDisplayUUID) {
-                    // Found a profile that should auto-activate for this specific display
-                    // Activate if:
-                    // 1. It's not the active profile, OR
-                    // 2. The current anchor display doesn't match the profile's anchor
-                    //    (user may have manually changed anchor while profile was "active")
-                    let currentAnchorMatchesProfile = AppSettings.shared.selectedDisplayUUID == profile.anchorDisplayUUID
+
+                if connectedIsUnique,
+                   let profile = AppSettings.shared.findAutoActivateProfile(
+                    forRuntimeDisplayID: connectedRuntimeID,
+                    snapshot: self.reconciliationSnapshot
+                   ) {
+                    let currentAnchorMatchesProfile =
+                        AppSettings.shared.selectedDisplayUUID == profile.anchorDisplayUUID
                     if AppSettings.shared.activeProfileID != profile.id || !currentAnchorMatchesProfile {
                         AppSettings.shared.switchToProfile(profile)
                         self.statusMessage = "Auto-activated profile: \(profile.name)"
@@ -1313,151 +1199,79 @@ class DockMonitor: NSObject, ObservableObject {
                     }
                 }
 
-                // If no profile was auto-activated, handle default anchor behavior
-                if !profileActivated {
-                    // Check if default anchor is "Main Display" and no profile is active
-                    if AppSettings.shared.activeProfileID == nil &&
-                       AppSettings.shared.defaultAnchorDisplay == .main {
-                        // Update to follow the current main display
-                        let mainDisplayUUID = self.getMainDisplayUUID()
-                        if self.anchorDisplayUUID != mainDisplayUUID {
-                            self.anchorDisplayUUID = mainDisplayUUID
-                            AppSettings.shared.selectedDisplayUUID = mainDisplayUUID
-                            self.updateAnchoredDisplayName()
-                            self.statusMessage = "Main display changed - anchoring to \(self.anchoredDisplay)"
-                        }
-                    } else {
-                        // Check if the user's saved preference reconnected
-                        let userPreferredUUID = AppSettings.shared.selectedDisplayUUID
-                        let preferredDisplayNowAvailable = self.isDisplayAvailable(uuid: userPreferredUUID)
-
-                        if preferredDisplayNowAvailable {
-                            // Get the current UUID for the reconnected display (may have updated suffix)
-                            if let currentUUID = self.getCurrentUUID(matching: userPreferredUUID),
-                               self.anchorDisplayUUID != currentUUID {
-                                // Restore the user's preferred anchor display
-                                self.anchorDisplayUUID = currentUUID
-                                self.updateAnchoredDisplayName()
-                                self.statusMessage = "Preferred display reconnected - restoring anchor to \(self.anchoredDisplay)"
-
-                                // Update AppSettings with the new fingerprint if it changed
-                                if currentUUID != userPreferredUUID {
-                                    AppSettings.shared.selectedDisplayUUID = currentUUID
-                                }
-                            }
-                        }
-                    }
-
-                    // Auto-relocate dock if enabled (with delay to let display stabilize)
-                    if AppSettings.shared.autoRelocateDock {
-                        DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { [weak self] in
-                            self?.relocateDockToAnchoredDisplay()
-                        }
-                    }
+                if !profileActivated,
+                   case let .resolved(preferredRuntimeID, _) = self.reconciliationSnapshot.resolve(
+                    AppSettings.shared.selectedDisplayUUID
+                   ), preferredRuntimeID == connectedRuntimeID {
+                    self.statusMessage = "Preferred display reconnected - restoring anchor to \(self.anchoredDisplay)"
+                } else if connectedDisplay?.resolution == .ambiguous {
+                    self.statusMessage = "Ambiguous display identity - preserving the preferred anchor"
                 }
 
-                // Reset status message after 3 seconds
-                DispatchQueue.main.asyncAfter(deadline: .now() + 3.0) { [weak self] in
-                    guard let self = self else { return }
-                    if self.isActive {
-                        self.statusMessage = "Dock Anchor Active - Monitoring mouse movement"
-                    } else {
-                        self.statusMessage = "Dock Anchor Ready"
+                // Never relocate because an ambiguous connected display happened
+                // to be enumerated first.
+                if !profileActivated,
+                   connectedIsUnique,
+                   self.anchorIdentityState == .unique,
+                   AppSettings.shared.autoRelocateDock {
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { [weak self] in
+                        self?.relocateDockToAnchoredDisplay()
                     }
                 }
+                self.resetStatusMessage(after: 3.0)
+
             } else if flags.contains(.removeFlag) {
-                self.statusMessage = "Display removed - updating available displays"
+                self.statusMessage = "Display removed - reconciling display identities"
                 self.updateAvailableDisplays()
-
-                // Check if the anchor display was removed (by checking if UUID is still available)
-                let anchorStillAvailable = self.availableDisplays.contains { $0.uuid == self.anchorDisplayUUID }
-                if !anchorStillAvailable {
-                    // Temporarily switch to the default anchor display for dock blocking purposes
-                    // but DON'T update AppSettings - we want to remember user's preference
-                    // so we can restore it when the display is reconnected
-                    let defaultUUID = self.getDefaultAnchorDisplayUUID()
-                    self.anchorDisplayUUID = defaultUUID
-                    self.updateAnchoredDisplayName()
-                    let defaultName = AppSettings.shared.defaultAnchorDisplay == .builtIn ? "Built-in" : "Primary"
+                if self.anchorIdentityState == .ambiguous {
+                    self.statusMessage = "Ambiguous display identity - preserving the preferred anchor"
+                } else if self.anchorIdentityState != .unique {
+                    let defaultName = AppSettings.shared.defaultAnchorDisplay == .builtIn
+                        ? "Built-in" : "Primary"
                     self.statusMessage = "Anchor display disconnected - temporarily using \(defaultName)"
                 }
+                self.resetStatusMessage(after: 3.0)
 
-                // Reset status message after 3 seconds
-                DispatchQueue.main.asyncAfter(deadline: .now() + 3.0) { [weak self] in
-                    guard let self = self else { return }
-                    if self.isActive {
-                        self.statusMessage = "Dock Anchor Active - Monitoring mouse movement"
-                    } else {
-                        self.statusMessage = "Dock Anchor Ready"
-                    }
-                }
-            } else if flags.contains(.enabledFlag) || flags.contains(.disabledFlag) {
-                self.updateAvailableDisplays()
             } else if flags.contains(.movedFlag) || flags.contains(.desktopShapeChangedFlag) {
-                // Display was moved/rearranged or desktop shape changed
-                // Use a small delay to ensure we're not updating during a view render cycle
                 DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) { [weak self] in
                     guard let self = self else { return }
                     self.updateAvailableDisplays()
                     self.statusMessage = "Display arrangement updated"
-
-                    // Force UI refresh
                     self.objectWillChange.send()
-
-                    // Reset status message after 2 seconds
-                    DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) { [weak self] in
-                        guard let self = self else { return }
-                        if self.isActive {
-                            self.statusMessage = "Dock Anchor Active - Monitoring mouse movement"
-                        } else {
-                            self.statusMessage = "Dock Anchor Ready"
-                        }
-                    }
+                    self.resetStatusMessage(after: 2.0)
                 }
+
             } else if flags.contains(.setMainFlag) {
-                // Primary display changed
                 DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) { [weak self] in
                     guard let self = self else { return }
                     self.updateAvailableDisplays()
-
-                    // If default anchor is "Main Display" and no profile is active, follow the new main
-                    if AppSettings.shared.activeProfileID == nil &&
-                       AppSettings.shared.defaultAnchorDisplay == .main {
-                        let mainDisplayUUID = self.getMainDisplayUUID()
-                        if self.anchorDisplayUUID != mainDisplayUUID {
-                            self.anchorDisplayUUID = mainDisplayUUID
-                            AppSettings.shared.selectedDisplayUUID = mainDisplayUUID
-                            self.updateAnchoredDisplayName()
-                            self.statusMessage = "Main display changed - anchoring to \(self.anchoredDisplay)"
-
-                            // Auto-relocate dock if enabled
-                            if AppSettings.shared.autoRelocateDock {
-                                DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
-                                    self?.relocateDockToAnchoredDisplay()
-                                }
-                            }
-
-                            // Reset status message after 3 seconds
-                            DispatchQueue.main.asyncAfter(deadline: .now() + 3.0) { [weak self] in
-                                guard let self = self else { return }
-                                if self.isActive {
-                                    self.statusMessage = "Dock Anchor Active - Monitoring mouse movement"
-                                } else {
-                                    self.statusMessage = "Dock Anchor Ready"
-                                }
-                            }
+                    self.statusMessage = "Main display updated"
+                    if self.anchorIdentityState != .ambiguous,
+                       AppSettings.shared.autoRelocateDock {
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
+                            self?.relocateDockToAnchoredDisplay()
                         }
                     }
+                    self.resetStatusMessage(after: 3.0)
                 }
-            } else if flags.contains(.setModeFlag) {
-                // Display mode changed
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) { [weak self] in
-                    self?.updateAvailableDisplays()
-                }
+
+            } else if flags.contains(.enabledFlag) ||
+                        flags.contains(.disabledFlag) ||
+                        flags.contains(.setModeFlag) {
+                self.updateAvailableDisplays()
             }
         }
     }
-    
+
+    private func resetStatusMessage(after delay: TimeInterval) {
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
+            guard let self = self else { return }
+            self.statusMessage = self.isActive
+                ? "Dock Anchor Active - Monitoring mouse movement"
+                : "Dock Anchor Ready"
+        }
+    }
+
     deinit {
         // Ensure we're on the main thread for cleanup
         if Thread.isMainThread {
