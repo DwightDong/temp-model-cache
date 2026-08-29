@@ -18,7 +18,8 @@ private func getAppVersion() -> String {
 // MARK: - Display Arrangement View
 struct DisplayArrangementView: View {
     let displays: [DockMonitor.DisplayInfo]
-    @Binding var selectedDisplayUUID: String
+    let selectedDisplayUUID: String
+    let onSelect: (DockMonitor.DisplayInfo) -> Void
     var maxHeight: CGFloat = 120
 
     var body: some View {
@@ -36,7 +37,7 @@ struct DisplayArrangementView: View {
                     )
                     .offset(x: frame.minX, y: frame.minY)
                     .onTapGesture {
-                        selectedDisplayUUID = display.uuid
+                        onSelect(display)
                     }
                 }
             }
@@ -470,7 +471,13 @@ struct ContentView: View {
                 // Visual Display Arrangement
                 DisplayArrangementView(
                     displays: dockMonitor.availableDisplays,
-                    selectedDisplayUUID: $appSettings.selectedDisplayUUID,
+                    selectedDisplayUUID: appSettings.selectedDisplayUUID,
+                    onSelect: { display in
+                        appSettings.selectDisplay(
+                            reference: display.uuid,
+                            identityResolution: display.identityResolution
+                        )
+                    },
                     maxHeight: 100
                 )
                 .padding(.vertical, 4)
@@ -570,9 +577,12 @@ struct ContentView: View {
             dockMonitor.restorePersistedAnchor()
         }
         .onChange(of: appSettings.selectedDisplayUUID) { oldValue, newValue in
-            dockMonitor.changeAnchorDisplay(toUUID: newValue)
-            // Auto-move dock to the newly selected display if enabled
-            if appSettings.autoRelocateDock && oldValue != newValue {
+            let decision = dockMonitor.changeAnchorDisplay(toUUID: newValue)
+            // Auto-move only after unique reconciliation. A temporary explicit
+            // selection may target an ambiguous display, but cannot infer a
+            // physical relocation destination.
+            if appSettings.autoRelocateDock && oldValue != newValue &&
+                decision.permitsAutomaticRelocation {
                 DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
                     dockMonitor.relocateDockToAnchoredDisplay()
                 }
@@ -685,7 +695,13 @@ struct SettingsView: View {
                         .fontWeight(.semibold)
                     DisplayArrangementView(
                         displays: dockMonitor.availableDisplays,
-                        selectedDisplayUUID: $appSettings.selectedDisplayUUID,
+                        selectedDisplayUUID: appSettings.selectedDisplayUUID,
+                        onSelect: { display in
+                            appSettings.selectDisplay(
+                                reference: display.uuid,
+                                identityResolution: display.identityResolution
+                            )
+                        },
                         maxHeight: 60
                     )
                     Text("\(dockMonitor.availableDisplays.count) display(s) detected")

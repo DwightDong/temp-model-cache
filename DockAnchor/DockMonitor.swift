@@ -89,7 +89,10 @@ class DockMonitor: NSObject, ObservableObject {
     /// Resolves persisted identity only. Explicit selection of a current
     /// ambiguous display goes through `changeAnchorDisplay`, never this lookup.
     func getDisplayID(forUUID uuid: String) -> CGDirectDisplayID? {
-        if case let .resolved(runtimeID, _) = reconciliationSnapshot.resolve(uuid) {
+        if case let .resolved(runtimeID, _) = reconciliationSnapshot.resolve(
+            uuid,
+            excludingInferredReferences: AppSettings.shared.nonPersistentDisplayReferences
+        ) {
             return CGDirectDisplayID(runtimeID)
         }
         return nil
@@ -100,7 +103,10 @@ class DockMonitor: NSObject, ObservableObject {
     }
 
     func displayIdentityState(for reference: String) -> AnchorIdentityState {
-        switch reconciliationSnapshot.resolve(reference) {
+        switch reconciliationSnapshot.resolve(
+            reference,
+            excludingInferredReferences: AppSettings.shared.nonPersistentDisplayReferences
+        ) {
         case .resolved: return .unique
         case .unavailable: return .unavailable
         case .ambiguous: return .ambiguous
@@ -113,7 +119,10 @@ class DockMonitor: NSObject, ObservableObject {
     }
 
     func getCurrentUUID(matching uuid: String) -> String? {
-        if case let .resolved(_, canonicalReference) = reconciliationSnapshot.resolve(uuid) {
+        if case let .resolved(_, canonicalReference) = reconciliationSnapshot.resolve(
+            uuid,
+            excludingInferredReferences: AppSettings.shared.nonPersistentDisplayReferences
+        ) {
             return canonicalReference
         }
         return nil
@@ -239,8 +248,18 @@ class DockMonitor: NSObject, ObservableObject {
             preferredReference: reference,
             fallbackRuntimeID: getDefaultAnchorDisplayID().map { UInt64($0) },
             snapshot: reconciliationSnapshot,
-            intent: intent
+            intent: intent,
+            excludingInferredReferences: AppSettings.shared.nonPersistentDisplayReferences
         )
+
+        // Also quarantine a legacy persisted selector the first time it is
+        // observed in an ambiguous snapshot. Once ambiguity has been observed,
+        // a later candidate disappearing is not new evidence about which
+        // physical monitor the old UUID/runtime selector represented.
+        if case .ambiguous = decision.preferredResolution,
+           reconciliationSnapshot.explicitRuntimeID(for: reference) != nil {
+            AppSettings.shared.markDisplayReferenceAsNonPersistent(reference)
+        }
 
         guard let runtimeID = decision.effectiveRuntimeID,
               let display = availableDisplays.first(where: {
@@ -322,6 +341,12 @@ class DockMonitor: NSObject, ObservableObject {
             intent: .explicitUserSelection,
             announceChange: true
         )
+        if decision.isTemporaryExplicitSelection {
+            // Defensive production boundary: callers should mark the display
+            // before publishing the setting, but legacy UI/menu paths may call
+            // this method directly.
+            AppSettings.shared.markDisplayReferenceAsNonPersistent(uuid)
+        }
         resetStatusMessage(after: 3.0)
         return decision
     }
@@ -1235,7 +1260,8 @@ class DockMonitor: NSObject, ObservableObject {
                     profileAutoActivation: settings.profiles.map(\.autoActivate),
                     currentAnchorIsUnique: self.anchorIdentityState == .unique,
                     autoRelocate: settings.autoRelocateDock,
-                    snapshot: self.reconciliationSnapshot
+                    snapshot: self.reconciliationSnapshot,
+                    excludingInferredReferences: settings.nonPersistentDisplayReferences
                 )
                 var profileActivated = false
 

@@ -536,8 +536,15 @@ class MenuBarManager: NSObject, ObservableObject {
     }
     
     @objc private func selectDisplay(_ sender: NSMenuItem) {
-        guard let displayUUID = sender.representedObject as? String else { return }
-        appSettings?.selectedDisplayUUID = displayUUID
+        guard let displayUUID = sender.representedObject as? String,
+              let appSettings = appSettings,
+              let display = dockMonitor?.availableDisplays.first(where: {
+                  $0.uuid == displayUUID
+              }) else { return }
+        appSettings.selectDisplay(
+            reference: displayUUID,
+            identityResolution: display.identityResolution
+        )
     }
 
     @objc private func selectTheme(_ sender: NSMenuItem) {

@@ -60,6 +60,12 @@ class AppSettings: ObservableObject {
 
     private let userDefaults: UserDefaults
     private let managesLoginItem: Bool
+    private static let nonPersistentDisplayReferencesKey = "nonPersistentDisplayReferencesV1"
+
+    /// Current-snapshot selectors chosen while physical identity was ambiguous.
+    /// These values are persisted only as provenance: they must never be
+    /// migrated, matched to profiles, or promoted into UUID alias history.
+    private(set) var nonPersistentDisplayReferences: Set<String>
 
     @Published var startAtLogin: Bool {
         didSet {
@@ -161,6 +167,9 @@ class AppSettings: ObservableObject {
     ) {
         self.userDefaults = userDefaults
         self.managesLoginItem = manageLoginItem
+        self.nonPersistentDisplayReferences = Set(
+            userDefaults.stringArray(forKey: Self.nonPersistentDisplayReferencesKey) ?? []
+        )
 
         // Tests and migrations can use an isolated defaults suite without
         // registering a real login item. Production still reflects the actual
@@ -273,6 +282,41 @@ class AppSettings: ObservableObject {
         return "DisplayID-\(mainDisplayID)"
     }
 
+    /// Persists the provenance of an ambiguous explicit selection before the
+    /// selected reference itself is published. Reusing the same UUID/runtime ID
+    /// after a port or topology change can then never imply physical continuity.
+    func selectDisplay(
+        reference: String,
+        identityResolution: DisplayPhysicalResolution
+    ) {
+        if identityResolution == .ambiguous {
+            markDisplayReferenceAsNonPersistent(reference)
+        } else {
+            clearNonPersistentMark(for: reference)
+        }
+        selectedDisplayUUID = reference
+    }
+
+    func markDisplayReferenceAsNonPersistent(_ reference: String) {
+        guard !reference.isEmpty,
+              nonPersistentDisplayReferences.insert(reference).inserted else {
+            return
+        }
+        saveNonPersistentDisplayReferences()
+    }
+
+    private func clearNonPersistentMark(for reference: String) {
+        guard nonPersistentDisplayReferences.remove(reference) != nil else { return }
+        saveNonPersistentDisplayReferences()
+    }
+
+    private func saveNonPersistentDisplayReferences() {
+        userDefaults.set(
+            nonPersistentDisplayReferences.sorted(),
+            forKey: Self.nonPersistentDisplayReferencesKey
+        )
+    }
+
     // MARK: - Profile Management
 
     /// Creates a new profile with the current anchor display
@@ -330,7 +374,23 @@ class AppSettings: ObservableObject {
         using snapshot: DisplayReconciliationSnapshot
     ) -> [String: String] {
         let references = [selectedDisplayUUID] + profiles.map(\.anchorDisplayUUID)
-        let result = DisplayReferenceMigrator.migrate(references: references, using: snapshot)
+
+        // Capture ambiguity for every persisted current-snapshot selector, not
+        // only the selected anchor. An inactive profile must not acquire a false
+        // identity later merely because one indistinguishable candidate left.
+        for reference in Set(references)
+        where !nonPersistentDisplayReferences.contains(reference) {
+            if case .ambiguous = snapshot.resolve(reference),
+               snapshot.explicitRuntimeID(for: reference) != nil {
+                markDisplayReferenceAsNonPersistent(reference)
+            }
+        }
+
+        let result = DisplayReferenceMigrator.migrate(
+            references: references,
+            using: snapshot,
+            excludingInferredReferences: nonPersistentDisplayReferences
+        )
 
         let migratedSelected = result.references[0]
         let migratedProfileReferences = Array(result.references.dropFirst())
@@ -357,7 +417,8 @@ class AppSettings: ObservableObject {
             for: runtimeID,
             references: profiles.map(\.anchorDisplayUUID),
             enabled: profiles.map(\.autoActivate),
-            snapshot: snapshot
+            snapshot: snapshot,
+            excludingInferredReferences: nonPersistentDisplayReferences
         ) else { return nil }
         return profiles[index]
     }

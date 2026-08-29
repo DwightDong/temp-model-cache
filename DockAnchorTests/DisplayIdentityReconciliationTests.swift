@@ -99,7 +99,8 @@ private func snapshotSignature(_ snapshot: DisplayReconciliationSnapshot) -> Str
 private func reconcileEveryPermutation(
     runtimes: [DisplayRuntimeObservation],
     metadata: [DisplayMetadataObservation],
-    prior: DisplayIdentityRegistry = DisplayIdentityRegistry()
+    prior: DisplayIdentityRegistry = DisplayIdentityRegistry(),
+    validate: (DisplayReconciliationSnapshot) -> Void = { _ in }
 ) -> DisplayReconciliationSnapshot {
     let snapshots = permutations(runtimes).flatMap { runtimeOrder in
         metadataPermutations(metadata).map { metadataOrder in
@@ -111,6 +112,7 @@ private func reconcileEveryPermutation(
         }
     }
     #expect(Set(snapshots.map(snapshotSignature)).count == 1)
+    snapshots.forEach(validate)
     return snapshots[0]
 }
 
@@ -614,6 +616,7 @@ struct DisplayIdentityReconciliationTests {
             mainDisplayReference: uuidA
         )
         #expect(settings.reconcileDisplayReferences(using: snapshot).isEmpty)
+        #expect(settings.nonPersistentDisplayReferences == Set([uuidB]))
         #expect(settings.selectedDisplayUUID == uuidB)
         #expect(settings.profiles == [profile])
         #expect(settings.activeProfileID == profileID)
@@ -833,17 +836,217 @@ struct DisplayIdentityReconciliationTests {
         let bID = snapshot.display(runtimeID: 20)?.identity?.canonicalID
         #expect(aID != nil && bID != nil && aID != bID)
         #expect(snapshot.displays.allSatisfy { $0.resolution == .unique })
-        #expect(snapshot.resolve("\(uuidA)-SN7") ==
-            .resolved(runtimeID: 10, canonicalReference: aID!))
-        #expect(snapshot.resolve("\(uuidB)-SN7") ==
-            .resolved(runtimeID: 20, canonicalReference: bID!))
 
-        let unknownAlias = "EEEEEEEE-EEEE-4EEE-8EEE-EEEEEEEEEEEE-SN7"
-        #expect(snapshot.resolve(unknownAlias) == .ambiguous(candidateRuntimeIDs: [10, 20]))
+        // The legacy serial shape does not contain vendor/product. Its UUID is
+        // a port alias, so even a currently matching alias cannot scope serial 7.
+        let references = ["\(uuidA)-SN7", "\(uuidB)-SN7",
+                          "EEEEEEEE-EEEE-4EEE-8EEE-EEEEEEEEEEEE-SN7"]
+        for reference in references {
+            #expect(snapshot.resolve(reference) ==
+                .ambiguous(candidateRuntimeIDs: [10, 20]))
+        }
         #expect(DisplayReferenceMigrator.migrate(
-            references: [unknownAlias],
+            references: references,
             using: snapshot
-        ).references == [unknownAlias])
+        ).references == references)
+
+        // Canonical scoped identities remain independently resolvable.
+        #expect(snapshot.resolve(aID!) == .resolved(runtimeID: 10, canonicalReference: aID!))
+        #expect(snapshot.resolve(bID!) == .resolved(runtimeID: 20, canonicalReference: bID!))
+    }
+
+    @Test("ambiguous explicit selections remain temporary after a port/topology change")
+    func ambiguousExplicitSelectionCannotAcquireContinuity() throws {
+        let ambiguous = reconcileEveryPermutation(
+            runtimes: [runtime(10, uuidA), runtime(20, uuidB)],
+            metadata: []
+        )
+        let suiteName = "DockAnchorTests.temporary-selection.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suiteName)!
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        defaults.set(uuidA, forKey: "selectedDisplayUUID")
+        let settings = AppSettings(
+            userDefaults: defaults,
+            manageLoginItem: false,
+            mainDisplayReference: uuidA
+        )
+
+        let explicit = DisplayAnchorResolver.resolve(
+            preferredReference: uuidB,
+            fallbackRuntimeID: 10,
+            snapshot: ambiguous,
+            intent: .explicitUserSelection
+        )
+        #expect(explicit.isTemporaryExplicitSelection)
+        #expect(explicit.effectiveRuntimeID == 20)
+        settings.selectDisplay(reference: uuidB, identityResolution: .ambiguous)
+        let profile = settings.createProfile(name: "Temporary B", autoActivate: true)
+        settings.activeProfileID = profile.id
+
+        // B's old UUID is now on the sole remaining same-model display. Model
+        // elimination makes that display unique, but says nothing about whether
+        // it is the physical display selected before the port change.
+        let afterPortAndTopologyChange = DisplayReconciler.reconcile(
+            runtimes: [runtime(200, uuidB)],
+            metadata: [],
+            priorRegistry: ambiguous.registry
+        )
+        #expect(afterPortAndTopologyChange.resolve(uuidB).isUniquelyResolved)
+        #expect(settings.reconcileDisplayReferences(using: afterPortAndTopologyChange).isEmpty)
+        #expect(settings.selectedDisplayUUID == uuidB)
+        #expect(settings.profiles.first?.anchorDisplayUUID == uuidB)
+        #expect(settings.activeProfileID == profile.id)
+
+        let restored = DisplayAnchorResolver.resolve(
+            preferredReference: uuidB,
+            fallbackRuntimeID: 200,
+            snapshot: afterPortAndTopologyChange,
+            intent: .persistedPreference,
+            excludingInferredReferences: settings.nonPersistentDisplayReferences
+        )
+        #expect(restored.preferredResolution == .ambiguous(candidateRuntimeIDs: [200]))
+        #expect(restored.usesFallback)
+        #expect(!restored.permitsAutomaticRelocation)
+        #expect(settings.findAutoActivateProfile(
+            forRuntimeDisplayID: 200,
+            snapshot: afterPortAndTopologyChange
+        ) == nil)
+        let hotPlug = DisplayHotPlugResolver.displayAdded(
+            runtimeID: 200,
+            preferredReference: settings.selectedDisplayUUID,
+            profileReferences: settings.profiles.map(\.anchorDisplayUUID),
+            profileAutoActivation: settings.profiles.map(\.autoActivate),
+            currentAnchorIsUnique: true,
+            autoRelocate: true,
+            snapshot: afterPortAndTopologyChange,
+            excludingInferredReferences: settings.nonPersistentDisplayReferences
+        )
+        #expect(hotPlug.isAmbiguous)
+        #expect(hotPlug.autoActivateProfileIndex == nil)
+        #expect(!hotPlug.restoresPreferredAnchor)
+        #expect(!hotPlug.permitsAutomaticRelocation)
+
+        // Provenance survives relaunch; otherwise the next launch would perform
+        // the unsafe migration after seeing only this one candidate.
+        let reloaded = AppSettings(
+            userDefaults: defaults,
+            manageLoginItem: false,
+            mainDisplayReference: uuidA
+        )
+        #expect(reloaded.nonPersistentDisplayReferences == Set([uuidB]))
+        #expect(reloaded.reconcileDisplayReferences(using: afterPortAndTopologyChange).isEmpty)
+        #expect(reloaded.selectedDisplayUUID == uuidB)
+        #expect(reloaded.profiles.first?.anchorDisplayUUID == uuidB)
+        #expect(reloaded.activeProfileID == profile.id)
+    }
+
+    @Test("a stale UUID cannot scope the same legacy serial across hardware models")
+    func staleAliasDoesNotDisambiguateUnscopedSerialAfterPortSwap() {
+        let established = reconcileEveryPermutation(
+            runtimes: [
+                runtime(10, uuidA, vendor: 100, product: 10, serial: 7),
+                runtime(20, uuidB, vendor: 200, product: 20, serial: 7)
+            ],
+            metadata: []
+        )
+        let aID = established.display(runtimeID: 10)!.identity!.canonicalID
+        let bID = established.display(runtimeID: 20)!.identity!.canonicalID
+
+        let legacyA = "\(uuidA)-SN7"
+        let legacyB = "\(uuidB)-SN7"
+        let swapped = reconcileEveryPermutation(
+            runtimes: [
+                runtime(30, uuidB, vendor: 100, product: 10, serial: 7),
+                runtime(40, uuidA, vendor: 200, product: 20, serial: 7)
+            ],
+            metadata: [
+                metadata("iokit", "hardware-b", uuidA, vendor: 200, product: 20, serial: 7),
+                metadata("iokit", "hardware-a", uuidB, vendor: 100, product: 10, serial: 7)
+            ],
+            prior: established.registry,
+            validate: { candidate in
+                #expect(candidate.resolve(legacyA) ==
+                    .ambiguous(candidateRuntimeIDs: [30, 40]))
+                #expect(candidate.resolve(legacyB) ==
+                    .ambiguous(candidateRuntimeIDs: [30, 40]))
+            }
+        )
+        #expect(swapped.resolve(legacyA) == .ambiguous(candidateRuntimeIDs: [30, 40]))
+        #expect(swapped.resolve(legacyB) == .ambiguous(candidateRuntimeIDs: [30, 40]))
+        #expect(DisplayReferenceMigrator.migrate(
+            references: [legacyA, legacyB],
+            using: swapped
+        ).references == [legacyA, legacyB])
+        #expect(swapped.resolve(aID) == .resolved(runtimeID: 30, canonicalReference: aID))
+        #expect(swapped.resolve(bID) == .resolved(runtimeID: 40, canonicalReference: bID))
+    }
+
+    @Test("duplicate metadata-only serial evidence is ambiguous, not unavailable")
+    func duplicateMetadataOnlySerialIsAmbiguous() {
+        let legacy = "99999999-9999-4999-8999-999999999999-SN7"
+        let snapshot = reconcileEveryPermutation(
+            runtimes: [runtime(1, uuidA), runtime(2, uuidB)],
+            metadata: [
+                metadata("iokit", "duplicate-a", uuidA, serial: 7),
+                metadata("iokit", "duplicate-b", uuidB, serial: 7)
+            ],
+            validate: { candidate in
+                #expect(candidate.resolve(legacy) ==
+                    .ambiguous(candidateRuntimeIDs: [1, 2]))
+            }
+        )
+        #expect(snapshot.displays.allSatisfy { $0.resolution == .ambiguous })
+        #expect(snapshot.registry.records.isEmpty)
+        #expect(snapshot.resolve(legacy) == .ambiguous(candidateRuntimeIDs: [1, 2]))
+        #expect(DisplayReferenceMigrator.migrate(
+            references: [legacy],
+            using: snapshot
+        ).references == [legacy])
+    }
+
+    @Test("canonical identity syntax is closed and strictly validated")
+    func malformedCanonicalLookingReferencesStayUnresolved() {
+        let validSnapshot = DisplayReconciler.reconcile(
+            runtimes: [runtime(20, uuidB, serial: 222)],
+            metadata: []
+        )
+        let validCanonical = validSnapshot.display(runtimeID: 20)!.identity!.canonicalID
+        #expect(validSnapshot.resolve(validCanonical) ==
+            .resolved(runtimeID: 20, canonicalReference: validCanonical))
+        #expect(validSnapshot.resolve("DockAnchorDisplay-V999M99-SN8") == .unavailable)
+
+        let malformed = [
+            "DockAnchorDisplay-garbage",
+            "DockAnchorDisplay-",
+            "DockAnchorDisplay-V100M10-extra",
+            "DockAnchorDisplay-V100M10-SN0",
+            "DockAnchorDisplay-V100M10-SN222-extra",
+            "DockAnchorDisplay-V0100M10-SN222",
+            "DockAnchorDisplay-V0M0",
+            "DockAnchorDisplay-UUID-not-a-uuid-V100M10",
+            "DockAnchorDisplay-UUID-\(uuidB.lowercased())-V100M10",
+            "DockAnchorDisplay-UUID-\(uuidB)-V0M0",
+            " DockAnchorDisplay-V100M10"
+        ]
+        let migration = DisplayReferenceMigrator.migrate(
+            references: malformed,
+            using: validSnapshot
+        )
+        #expect(migration.references == malformed)
+        #expect(migration.migrations.isEmpty)
+        for reference in malformed {
+            #expect(validSnapshot.resolve(reference) == .unresolved)
+        }
+
+        let cleaned = DisplayIdentityRegistry(records: [
+            DisplayIdentityRecord(
+                canonicalID: "DockAnchorDisplay-garbage",
+                vendorID: 100,
+                productID: 10,
+                uuidAliases: [uuidB]
+            )
+        ])
+        #expect(cleaned.records.isEmpty)
     }
 
 }

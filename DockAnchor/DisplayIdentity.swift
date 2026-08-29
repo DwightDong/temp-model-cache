@@ -176,6 +176,14 @@ struct DisplayIdentityRegistry: Equatable, Codable {
                     }
                     normalized.canonicalID = "DockAnchorDisplay-V\(normalized.vendorID)M\(normalized.productID)-SN\(serial)"
                 }
+
+                // Canonical IDs are internal data, not an open-ended namespace.
+                // Discard records emitted by buggy development builds rather
+                // than allowing an arbitrary `DockAnchorDisplay-*` value to
+                // become identity evidence through an exact string match.
+                guard DisplayReference.isValidCanonicalID(normalized.canonicalID) else {
+                    return nil
+                }
                 return normalized
             }
             .sorted { lhs, rhs in
@@ -255,33 +263,47 @@ private struct IdentityAvailability {
     var canBeUnavailable: Bool
 }
 
+/// Raw serial observations retained only to classify legacy `UUID-SN*`
+/// references. Invalid evidence never creates an identity, but it must remain
+/// visible as ambiguity instead of being mistaken for a disconnected display.
+private struct SerialReferenceEvidence {
+    var hardwareScopes: Set<DisplayHardwareKey>
+    var candidateRuntimeIDs: Set<UInt64>
+    var containsInvalidEvidence: Bool
+}
+
 struct DisplayReconciliationSnapshot {
     let displays: [ReconciledDisplay]
     let registry: DisplayIdentityRegistry
 
     private let availabilityByCanonicalID: [String: IdentityAvailability]
+    private let serialReferenceEvidence: [UInt32: SerialReferenceEvidence]
 
     fileprivate init(
         displays: [ReconciledDisplay],
         registry: DisplayIdentityRegistry,
-        availabilityByCanonicalID: [String: IdentityAvailability]
+        availabilityByCanonicalID: [String: IdentityAvailability],
+        serialReferenceEvidence: [UInt32: SerialReferenceEvidence]
     ) {
         self.displays = displays.sorted { $0.runtime.runtimeID < $1.runtime.runtimeID }
         self.registry = registry
         self.availabilityByCanonicalID = availabilityByCanonicalID
+        self.serialReferenceEvidence = serialReferenceEvidence
     }
 
     static let empty = DisplayReconciliationSnapshot(
         displays: [],
         registry: DisplayIdentityRegistry(),
-        availabilityByCanonicalID: [:]
+        availabilityByCanonicalID: [:],
+        serialReferenceEvidence: [:]
     )
 
     func withRegistry(_ registry: DisplayIdentityRegistry) -> DisplayReconciliationSnapshot {
         DisplayReconciliationSnapshot(
             displays: displays,
             registry: registry,
-            availabilityByCanonicalID: availabilityByCanonicalID
+            availabilityByCanonicalID: availabilityByCanonicalID,
+            serialReferenceEvidence: serialReferenceEvidence
         )
     }
 
@@ -289,7 +311,10 @@ struct DisplayReconciliationSnapshot {
         displays.first { $0.runtime.runtimeID == runtimeID }
     }
 
-    func resolve(_ rawReference: String) -> DisplayReferenceResolution {
+    func resolve(
+        _ rawReference: String,
+        excludingInferredReferences: Set<String> = []
+    ) -> DisplayReferenceResolution {
         let parsed = DisplayReference.parse(rawReference)
 
         // Unknown and malformed input is never identity evidence, even if an
@@ -297,12 +322,22 @@ struct DisplayReconciliationSnapshot {
         // in the alias registry.
         guard parsed.kind != .malformed else { return .unresolved }
 
-        // Canonical and explicitly recorded legacy references have the most
-        // context. In particular, this keeps an established identity stronger
-        // than a UUID alias which may have moved to another port.
+        // An explicit choice made while identity was ambiguous is a selector for
+        // that snapshot, not a newly discovered UUID alias. Keep that provenance
+        // across refreshes so one-to-one model elimination after a port/topology
+        // change cannot silently promote the choice to a physical identity.
+        if excludingInferredReferences.contains(rawReference) {
+            return quarantinedResolution(for: parsed)
+        }
+
+        // A canonical reference can use exact registry context immediately.
+        // Serial legacy references deliberately skip exact alias history: their
+        // old UUID prefix is port-derived and cannot scope a decimal serial that
+        // is known in more than one vendor/product namespace.
         let exactRecords = registry.records.filter { record in
             record.canonicalID == rawReference ||
-                (parsed.kind != .vendorModel && record.legacyReferences.contains(rawReference))
+                (parsed.kind != .serial && parsed.kind != .vendorModel &&
+                    record.legacyReferences.contains(rawReference))
         }
         if !exactRecords.isEmpty {
             return resolution(for: exactRecords)
@@ -325,10 +360,25 @@ struct DisplayReconciliationSnapshot {
 
         case .serial:
             guard let serial = parsed.serialNumber else { return .unresolved }
-            var records = registry.records.filter { $0.serialNumber == serial }
-            if let alias = parsed.uuidAlias.flatMap(DisplayReference.normalizedUUIDAlias) {
-                let scoped = records.filter { $0.uuidAliases.contains(alias) }
-                if !scoped.isEmpty { records = scoped }
+            let records = registry.records.filter { $0.serialNumber == serial }
+            let evidence = serialReferenceEvidence[serial]
+            var hardwareScopes = Set(records.compactMap(\.hardwareKey))
+            hardwareScopes.formUnion(evidence?.hardwareScopes ?? [])
+
+            var candidateRuntimeIDs = evidence?.candidateRuntimeIDs ?? []
+            for record in records {
+                candidateRuntimeIDs.formUnion(
+                    availabilityByCanonicalID[record.canonicalID]?.runtimeIDs ?? []
+                )
+            }
+
+            // The legacy syntax stores only the decimal serial. Its UUID prefix
+            // is a movable port alias, so it cannot choose between equal serials
+            // from different vendor/product scopes. Duplicate or conflicting
+            // raw observations are likewise ambiguity, even when they came only
+            // from metadata and created no stable registry record.
+            if hardwareScopes.count > 1 || evidence?.containsInvalidEvidence == true {
+                return .ambiguous(candidateRuntimeIDs: candidateRuntimeIDs)
             }
 
             if !records.isEmpty {
@@ -341,14 +391,9 @@ struct DisplayReconciliationSnapshot {
             if !current.isEmpty {
                 return resolution(forCurrentDisplays: current, absentIsUnavailable: true)
             }
-            // Preserve duplicate/conflicting raw serial evidence as ambiguity;
-            // never turn it into a stable physical identity.
-            let rawCandidates = displays.filter { $0.runtime.serialNumber == serial }
-            if !rawCandidates.isEmpty {
-                let ids = rawCandidates.reduce(into: Set<UInt64>()) {
-                    $0.formUnion($1.ambiguityCandidateRuntimeIDs)
-                }
-                return .ambiguous(candidateRuntimeIDs: ids)
+
+            if evidence != nil {
+                return .ambiguous(candidateRuntimeIDs: candidateRuntimeIDs)
             }
             return .unavailable
 
@@ -411,7 +456,7 @@ struct DisplayReconciliationSnapshot {
     /// from persistent identity resolution: it permits an explicit click on an
     /// ambiguous display without teaching the registry that a UUID or runtime
     /// ID identifies that physical monitor.
-    fileprivate func explicitRuntimeID(for rawReference: String) -> UInt64? {
+    func explicitRuntimeID(for rawReference: String) -> UInt64? {
         let parsed = DisplayReference.parse(rawReference)
         switch parsed.kind {
         case .runtime:
@@ -429,6 +474,39 @@ struct DisplayReconciliationSnapshot {
             return candidates.count == 1 ? candidates[0].runtime.runtimeID : nil
         default:
             return nil
+        }
+    }
+
+    private func quarantinedResolution(
+        for parsed: DisplayReference
+    ) -> DisplayReferenceResolution {
+        switch parsed.kind {
+        case .bareUUID:
+            guard let alias = parsed.uuidAlias.flatMap(DisplayReference.normalizedUUIDAlias) else {
+                return .unresolved
+            }
+            let candidates = displays.filter {
+                $0.runtime.uuidAlias.flatMap(DisplayReference.normalizedUUIDAlias) == alias
+            }
+            guard !candidates.isEmpty else { return .unavailable }
+            let ids = candidates.reduce(into: Set<UInt64>()) {
+                $0.formUnion($1.ambiguityCandidateRuntimeIDs)
+            }
+            return .ambiguous(candidateRuntimeIDs: ids)
+
+        case .runtime:
+            guard let runtimeID = parsed.runtimeID,
+                  let display = display(runtimeID: runtimeID) else {
+                return .unavailable
+            }
+            return .ambiguous(candidateRuntimeIDs: display.ambiguityCandidateRuntimeIDs)
+
+        // Ambiguous display rows expose only a current UUID or runtime selector.
+        // Refuse inference for any other accidentally quarantined shape as well.
+        case .canonical, .serial, .vendorModel:
+            return .ambiguous(candidateRuntimeIDs: [])
+        case .malformed:
+            return .unresolved
         }
     }
 
@@ -481,11 +559,15 @@ struct DisplayReferenceMigrationResult: Equatable {
 enum DisplayReferenceMigrator {
     static func migrate(
         references: [String],
-        using snapshot: DisplayReconciliationSnapshot
+        using snapshot: DisplayReconciliationSnapshot,
+        excludingInferredReferences: Set<String> = []
     ) -> DisplayReferenceMigrationResult {
         var cache: [String: String] = [:]
         for reference in Set(references) {
-            if case let .resolved(_, canonicalReference) = snapshot.resolve(reference),
+            if case let .resolved(_, canonicalReference) = snapshot.resolve(
+                reference,
+                excludingInferredReferences: excludingInferredReferences
+            ),
                canonicalReference != reference {
                 cache[reference] = canonicalReference
             }
@@ -526,9 +608,13 @@ enum DisplayAnchorResolver {
         preferredReference: String,
         fallbackRuntimeID: UInt64?,
         snapshot: DisplayReconciliationSnapshot,
-        intent: DisplayAnchorSelectionIntent = .persistedPreference
+        intent: DisplayAnchorSelectionIntent = .persistedPreference,
+        excludingInferredReferences: Set<String> = []
     ) -> DisplayAnchorDecision {
-        let preferred = snapshot.resolve(preferredReference)
+        let preferred = snapshot.resolve(
+            preferredReference,
+            excludingInferredReferences: excludingInferredReferences
+        )
         if case let .resolved(runtimeID, _) = preferred {
             return DisplayAnchorDecision(
                 preferredResolution: preferred,
@@ -564,7 +650,8 @@ enum DisplayProfileMatcher {
         for runtimeID: UInt64,
         references: [String],
         enabled: [Bool],
-        snapshot: DisplayReconciliationSnapshot
+        snapshot: DisplayReconciliationSnapshot,
+        excludingInferredReferences: Set<String> = []
     ) -> Int? {
         guard references.count == enabled.count,
               snapshot.display(runtimeID: runtimeID)?.resolution == .unique else {
@@ -572,7 +659,10 @@ enum DisplayProfileMatcher {
         }
         let matches = references.indices.filter { index in
             guard enabled[index] else { return false }
-            if case let .resolved(resolvedID, _) = snapshot.resolve(references[index]) {
+            if case let .resolved(resolvedID, _) = snapshot.resolve(
+                references[index],
+                excludingInferredReferences: excludingInferredReferences
+            ) {
                 return resolvedID == runtimeID
             }
             return false
@@ -584,11 +674,14 @@ enum DisplayProfileMatcher {
 
 struct DisplayHotPlugDecision: Equatable {
     let connectedResolution: DisplayPhysicalResolution?
+    let preferredReferenceIsAmbiguous: Bool
     let autoActivateProfileIndex: Int?
     let restoresPreferredAnchor: Bool
     let permitsAutomaticRelocation: Bool
 
-    var isAmbiguous: Bool { connectedResolution == .ambiguous }
+    var isAmbiguous: Bool {
+        connectedResolution == .ambiguous || preferredReferenceIsAmbiguous
+    }
 }
 
 enum DisplayHotPlugResolver {
@@ -602,12 +695,25 @@ enum DisplayHotPlugResolver {
         profileAutoActivation: [Bool],
         currentAnchorIsUnique: Bool,
         autoRelocate: Bool,
-        snapshot: DisplayReconciliationSnapshot
+        snapshot: DisplayReconciliationSnapshot,
+        excludingInferredReferences: Set<String> = []
     ) -> DisplayHotPlugDecision {
         let resolution = snapshot.display(runtimeID: runtimeID)?.resolution
+        let preferredResolution = snapshot.resolve(
+            preferredReference,
+            excludingInferredReferences: excludingInferredReferences
+        )
+        let preferredIsAmbiguous: Bool
+        if case .ambiguous = preferredResolution {
+            preferredIsAmbiguous = true
+        } else {
+            preferredIsAmbiguous = false
+        }
+
         guard resolution == .unique else {
             return DisplayHotPlugDecision(
                 connectedResolution: resolution,
+                preferredReferenceIsAmbiguous: preferredIsAmbiguous,
                 autoActivateProfileIndex: nil,
                 restoresPreferredAnchor: false,
                 permitsAutomaticRelocation: false
@@ -618,10 +724,11 @@ enum DisplayHotPlugResolver {
             for: runtimeID,
             references: profileReferences,
             enabled: profileAutoActivation,
-            snapshot: snapshot
+            snapshot: snapshot,
+            excludingInferredReferences: excludingInferredReferences
         )
         let restoresPreferred: Bool
-        if case let .resolved(preferredRuntimeID, _) = snapshot.resolve(preferredReference) {
+        if case let .resolved(preferredRuntimeID, _) = preferredResolution {
             restoresPreferred = preferredRuntimeID == runtimeID
         } else {
             restoresPreferred = false
@@ -629,9 +736,10 @@ enum DisplayHotPlugResolver {
 
         return DisplayHotPlugDecision(
             connectedResolution: resolution,
+            preferredReferenceIsAmbiguous: preferredIsAmbiguous,
             autoActivateProfileIndex: profileIndex,
             restoresPreferredAnchor: restoresPreferred,
-            permitsAutomaticRelocation: currentAnchorIsUnique && autoRelocate
+            permitsAutomaticRelocation: !preferredIsAmbiguous && currentAnchorIsUnique && autoRelocate
         )
     }
 }
@@ -678,6 +786,10 @@ private struct DisplayReference {
         }
     }
 
+    static func isValidCanonicalID(_ canonicalID: String) -> Bool {
+        parseCanonical(canonicalID) != nil
+    }
+
     static func isRuntimeDerivedCanonicalID(_ canonicalID: String) -> Bool {
         let normalized = canonicalID.uppercased()
         return normalized.hasPrefix("DISPLAYID-") ||
@@ -690,14 +802,7 @@ private struct DisplayReference {
         }
 
         if raw.hasPrefix("DockAnchorDisplay-") {
-            return DisplayReference(
-                kind: .canonical,
-                uuidAlias: nil,
-                serialNumber: nil,
-                vendorID: nil,
-                productID: nil,
-                runtimeID: nil
-            )
+            return parseCanonical(raw) ?? malformed
         }
 
         // DisplayID values were emitted only when CoreGraphics did not provide
@@ -789,6 +894,89 @@ private struct DisplayReference {
         }
 
         return malformed
+    }
+
+    /// Parses only canonical IDs emitted by `DisplayReconciler`:
+    ///
+    /// - `DockAnchorDisplay-V<vendor>M<product>-SN<serial>`
+    /// - `DockAnchorDisplay-UUID-<uuid>-V<vendor>M<product>`
+    /// - `DockAnchorDisplay-V<vendor>M<product>`
+    ///
+    /// Prefix matching alone is intentionally insufficient. Unknown
+    /// canonical-looking settings must remain malformed and unresolved.
+    private static func parseCanonical(_ raw: String) -> DisplayReference? {
+        let prefix = "DockAnchorDisplay-"
+        guard raw.hasPrefix(prefix) else { return nil }
+        let body = String(raw.dropFirst(prefix.count))
+
+        if body.hasPrefix("UUID-") {
+            let uuidAndModel = String(body.dropFirst("UUID-".count))
+            guard uuidAndModel.count > 37 else { return nil }
+            let alias = String(uuidAndModel.prefix(36))
+            let modelSuffix = String(uuidAndModel.dropFirst(36))
+            guard let normalizedAlias = normalizedUUIDAlias(alias),
+                  normalizedAlias == alias,
+                  modelSuffix.hasPrefix("-"),
+                  let model = parseVendorModel(String(modelSuffix.dropFirst())) else {
+                return nil
+            }
+            return DisplayReference(
+                kind: .canonical,
+                uuidAlias: alias,
+                serialNumber: nil,
+                vendorID: model.vendor,
+                productID: model.product,
+                runtimeID: nil
+            )
+        }
+
+        if let serialMarker = body.range(of: "-SN", options: .backwards) {
+            let modelText = String(body[..<serialMarker.lowerBound])
+            let serialText = body[serialMarker.upperBound...]
+            guard let model = parseVendorModel(modelText),
+                  let serial = decimalUInt32(serialText), serial != 0,
+                  String(serial) == String(serialText) else {
+                return nil
+            }
+            return DisplayReference(
+                kind: .canonical,
+                uuidAlias: nil,
+                serialNumber: serial,
+                vendorID: model.vendor,
+                productID: model.product,
+                runtimeID: nil
+            )
+        }
+
+        guard let model = parseVendorModel(body) else { return nil }
+        return DisplayReference(
+            kind: .canonical,
+            uuidAlias: nil,
+            serialNumber: nil,
+            vendorID: model.vendor,
+            productID: model.product,
+            runtimeID: nil
+        )
+    }
+
+    private static func parseVendorModel(
+        _ text: String
+    ) -> (vendor: UInt32, product: UInt32)? {
+        guard text.hasPrefix("V"),
+              let modelMarker = text.firstIndex(of: "M") else {
+            return nil
+        }
+        let vendorStart = text.index(after: text.startIndex)
+        let vendorText = text[vendorStart..<modelMarker]
+        let productText = text[text.index(after: modelMarker)...]
+        guard let vendor = decimalUInt32(vendorText),
+              let product = decimalUInt32(productText),
+              String(vendor) == String(vendorText),
+              String(product) == String(productText),
+              vendor != 0 || product != 0 else {
+            return nil
+        }
+        return (vendor, product)
     }
 
     private static func decimalUInt32<S: StringProtocol>(_ text: S) -> UInt32? {
@@ -1034,6 +1222,11 @@ enum DisplayReconciler {
         let prior = DisplayIdentityRegistry(records: priorRegistry.records)
 
         let invalidSerialKeys = findInvalidSerialKeys(runtimes: runtimes, metadata: metadata)
+        let serialEvidence = collectSerialReferenceEvidence(
+            runtimes: runtimes,
+            metadata: metadata,
+            invalidSerialKeys: invalidSerialKeys
+        )
         let metadataResult = reconcileMetadata(
             runtimes: runtimes,
             metadata: metadata,
@@ -1195,7 +1388,8 @@ enum DisplayReconciler {
         return DisplayReconciliationSnapshot(
             displays: reconciled,
             registry: registryResult.registry,
-            availabilityByCanonicalID: availability
+            availabilityByCanonicalID: availability,
+            serialReferenceEvidence: serialEvidence
         )
     }
 
@@ -1455,6 +1649,71 @@ enum DisplayReconciler {
             identityByRuntime: canonicalByRuntime.map { $0.flatMap { byCanonical[$0] } },
             replacementCanonicalIDs: replacements
         )
+    }
+
+    private static func collectSerialReferenceEvidence(
+        runtimes: [DisplayRuntimeObservation],
+        metadata: [DisplayMetadataObservation],
+        invalidSerialKeys: Set<DisplayHardwareKey>
+    ) -> [UInt32: SerialReferenceEvidence] {
+        var result: [UInt32: SerialReferenceEvidence] = [:]
+
+        func add(
+            serialNumber: UInt32?,
+            vendorID: UInt32,
+            productID: UInt32,
+            candidateRuntimeIDs: Set<UInt64>
+        ) {
+            guard let serialNumber, serialNumber != 0 else { return }
+            let key = DisplayHardwareKey(
+                vendorID: vendorID,
+                productID: productID,
+                serialNumber: serialNumber
+            )
+            var evidence = result[serialNumber] ?? SerialReferenceEvidence(
+                hardwareScopes: [],
+                candidateRuntimeIDs: [],
+                containsInvalidEvidence: false
+            )
+            evidence.hardwareScopes.insert(key)
+            evidence.candidateRuntimeIDs.formUnion(candidateRuntimeIDs)
+            if (vendorID == 0 && productID == 0) || invalidSerialKeys.contains(key) {
+                evidence.containsInvalidEvidence = true
+            }
+            result[serialNumber] = evidence
+        }
+
+        for runtime in runtimes {
+            add(
+                serialNumber: runtime.serialNumber,
+                vendorID: runtime.vendorID,
+                productID: runtime.productID,
+                candidateRuntimeIDs: [runtime.runtimeID]
+            )
+        }
+
+        for record in metadata {
+            // Do not narrow this diagnostic evidence with a UUID. UUIDs describe
+            // ports and are specifically unsafe for an unscoped legacy serial
+            // after a port swap. Reconciled strong assignments still resolve via
+            // the canonical/current-display paths above.
+            let candidates = Set(runtimes.filter {
+                modelsCompatible(
+                    lhsVendor: $0.vendorID,
+                    lhsProduct: $0.productID,
+                    rhsVendor: record.vendorID,
+                    rhsProduct: record.productID
+                )
+            }.map(\.runtimeID))
+            add(
+                serialNumber: record.serialNumber,
+                vendorID: record.vendorID,
+                productID: record.productID,
+                candidateRuntimeIDs: candidates
+            )
+        }
+
+        return result
     }
 
     private static func findInvalidSerialKeys(
