@@ -1753,6 +1753,199 @@ struct DisplayIdentityReconciliationTests {
         #expect(settings.activeProfileID == profile.id)
     }
 
+    @Test("stable canonical profile activation recovers after temporary ambiguity")
+    func stableCanonicalProfileActivationDoesNotQuarantineIdentity() throws {
+        let established = reconcileEveryPermutation(
+            runtimes: [
+                runtime(1, uuidA, serial: 111),
+                runtime(2, uuidB, serial: 222)
+            ],
+            metadata: [
+                metadata("iokit", "physical-b", uuidB, serial: 222),
+                metadata("iokit", "physical-a", uuidA, serial: 111)
+            ]
+        )
+        let bID = canonicalBySerial(222, in: established)!
+
+        // Both stable identities remain in the registry, but a refresh with no
+        // serials or surviving aliases cannot tell which runtime is physical B.
+        let ambiguous = reconcileEveryPermutation(
+            runtimes: [runtime(10, uuidC), runtime(20, uuidD)],
+            metadata: [
+                metadata("profiler", "unknown-d", vendor: 100, product: 10),
+                metadata("profiler", "unknown-c", vendor: 100, product: 10)
+            ],
+            prior: established.registry
+        )
+        #expect(ambiguous.resolve(bID) == .ambiguous(candidateRuntimeIDs: [10, 20]))
+        // Provenance accidentally persisted by a previous build must not weaken
+        // a canonical identity either.
+        #expect(ambiguous.resolve(bID, excludingInferredReferences: [bID]) ==
+            .ambiguous(candidateRuntimeIDs: [10, 20]))
+
+        let suiteName = "DockAnchorTests.stable-profile-ambiguity.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suiteName)!
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        defaults.set(bID, forKey: "selectedDisplayUUID")
+        // Simulate provenance written for a canonical profile by the previous
+        // implementation; initialization must discard this invalid quarantine.
+        defaults.set([bID], forKey: "nonPersistentDisplayReferencesV1")
+        let settings = AppSettings(
+            userDefaults: defaults,
+            manageLoginItem: false,
+            mainDisplayReference: uuidC
+        )
+        let profile = DockProfile(
+            id: UUID(uuidString: "ABABABAB-1234-4234-8234-123456789012")!,
+            name: "Stable physical B",
+            anchorDisplayUUID: bID,
+            createdAt: Date(timeIntervalSinceReferenceDate: 1_234),
+            autoActivate: true
+        )
+        settings.profiles = [profile]
+
+        let activation = settings.switchToProfile(profile, using: ambiguous)
+        #expect(activation == .ambiguous(candidateRuntimeIDs: [10, 20]))
+        #expect(settings.activeProfileID == profile.id)
+        #expect(settings.selectedDisplayUUID == bID)
+        #expect(settings.profiles == [profile])
+        #expect(settings.nonPersistentDisplayReferences.isEmpty)
+        #expect(defaults.stringArray(forKey: "nonPersistentDisplayReferencesV1") == [])
+
+        let temporaryDecision = DisplayAnchorResolver.resolve(
+            preferredReference: bID,
+            fallbackRuntimeID: 10,
+            snapshot: ambiguous,
+            excludingInferredReferences: settings.nonPersistentDisplayReferences
+        )
+        #expect(temporaryDecision.usesFallback)
+        #expect(temporaryDecision.effectiveRuntimeID == 10)
+        #expect(!temporaryDecision.permitsAutomaticRelocation)
+
+        // Authoritative serials return with different runtime IDs and aliases.
+        // The same canonical profile must immediately recover and auto-match.
+        let restored = reconcileEveryPermutation(
+            runtimes: [
+                runtime(100, uuidD, serial: 111),
+                runtime(200, uuidC, serial: 222)
+            ],
+            metadata: [
+                metadata("iokit", "restored-b", uuidC, serial: 222),
+                metadata("iokit", "restored-a", uuidD, serial: 111)
+            ],
+            prior: ambiguous.registry
+        )
+        #expect(restored.resolve(bID, excludingInferredReferences: [bID]) ==
+            .resolved(runtimeID: 200, canonicalReference: bID))
+        #expect(settings.reconcileDisplayReferences(using: restored).isEmpty)
+        #expect(settings.findAutoActivateProfile(
+            forRuntimeDisplayID: 200,
+            snapshot: restored
+        ) == profile)
+
+        let restoredDecision = DisplayAnchorResolver.resolve(
+            preferredReference: settings.selectedDisplayUUID,
+            fallbackRuntimeID: 100,
+            snapshot: restored,
+            excludingInferredReferences: settings.nonPersistentDisplayReferences
+        )
+        #expect(!restoredDecision.usesFallback)
+        #expect(restoredDecision.effectiveRuntimeID == 200)
+        #expect(restoredDecision.permitsAutomaticRelocation)
+        #expect(settings.profiles == [profile])
+        #expect(settings.activeProfileID == profile.id)
+    }
+
+    @Test("identity evidence propagates across metadata sources")
+    func transitiveMetadataAssociationUsesLearnedSerials() {
+        let snapshot = reconcileEveryPermutation(
+            runtimes: [
+                runtime(10, uuidA, serial: nil),
+                runtime(20, uuidB, serial: nil)
+            ],
+            metadata: [
+                // IOKit can be assigned by UUID and teaches the scoped serial.
+                metadata("iokit", "io-b", uuidB, serial: 222, priority: 10),
+                metadata("iokit", "io-a", uuidA, serial: 111, priority: 10),
+                // Profiler lacks UUIDs. Its records and names become unique only
+                // after the IOKit serial assignment is propagated.
+                metadata("profiler", "profile-a", serial: 111,
+                         name: "Physical Monitor A", priority: 100),
+                metadata("profiler", "profile-b", serial: 222,
+                         name: "Physical Monitor B", priority: 100)
+            ],
+            validate: { candidate in
+                let a = candidate.display(runtimeID: 10)
+                let b = candidate.display(runtimeID: 20)
+                #expect(a?.resolution == .unique)
+                #expect(b?.resolution == .unique)
+                #expect(a?.identity?.serialNumber == 111)
+                #expect(b?.identity?.serialNumber == 222)
+                #expect(a?.metadataAssignments == [
+                    "iokit": "io-a",
+                    "profiler": "profile-a"
+                ])
+                #expect(b?.metadataAssignments == [
+                    "iokit": "io-b",
+                    "profiler": "profile-b"
+                ])
+                #expect(a?.friendlyName == "Physical Monitor A")
+                #expect(b?.friendlyName == "Physical Monitor B")
+            }
+        )
+
+        #expect(Set(snapshot.displays.compactMap {
+            $0.metadataAssignments["profiler"]
+        }) == Set(["profile-a", "profile-b"]))
+    }
+
+    @Test("multiple residual serial conflicts are suppressed")
+    func multipleResidualSerialConflictsAreAmbiguous() {
+        let runtimeSerialA = "\(uuidA)-SN111"
+        let runtimeSerialB = "\(uuidB)-SN222"
+        let metadataSerialC = "\(uuidC)-SN333"
+        let snapshot = reconcileEveryPermutation(
+            runtimes: [
+                runtime(10, uuidA, serial: 111),
+                runtime(20, uuidB, serial: 222)
+            ],
+            metadata: [
+                metadata("iokit", "conflict-d", vendor: 100, product: 10,
+                         serial: 444, name: "Untrusted D"),
+                metadata("iokit", "conflict-c", vendor: 100, product: 10,
+                         serial: 333, name: "Untrusted C")
+            ],
+            validate: { candidate in
+                #expect(candidate.displays.allSatisfy { $0.resolution == .ambiguous })
+                #expect(candidate.displays.allSatisfy { $0.identity == nil })
+                #expect(candidate.displays.allSatisfy { $0.metadataAssignments.isEmpty })
+                #expect(candidate.displays.allSatisfy { $0.friendlyName == nil })
+                #expect(candidate.registry.records.isEmpty)
+                #expect(candidate.resolve(runtimeSerialA) ==
+                    .ambiguous(candidateRuntimeIDs: [10]))
+                #expect(candidate.resolve(runtimeSerialB) ==
+                    .ambiguous(candidateRuntimeIDs: [20]))
+                #expect(candidate.resolve(metadataSerialC) ==
+                    .ambiguous(candidateRuntimeIDs: [10, 20]))
+                #expect(DisplayProfileMatcher.uniqueMatch(
+                    for: 10,
+                    references: [runtimeSerialA, runtimeSerialB],
+                    enabled: [true, true],
+                    snapshot: candidate
+                ) == nil)
+            }
+        )
+
+        let decision = DisplayAnchorResolver.resolve(
+            preferredReference: runtimeSerialB,
+            fallbackRuntimeID: 10,
+            snapshot: snapshot
+        )
+        #expect(decision.usesFallback)
+        #expect(decision.effectiveRuntimeID == 10)
+        #expect(!decision.permitsAutomaticRelocation)
+    }
+
     @Test("canonical identity syntax is closed and strictly validated")
     func malformedCanonicalLookingReferencesStayUnresolved() {
         let validSnapshot = DisplayReconciler.reconcile(

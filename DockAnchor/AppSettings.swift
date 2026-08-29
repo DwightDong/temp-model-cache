@@ -210,9 +210,18 @@ class AppSettings: ObservableObject {
     ) {
         self.userDefaults = userDefaults
         self.managesLoginItem = manageLoginItem
-        self.nonPersistentDisplayReferences = Set(
+        let storedNonPersistentReferences =
             userDefaults.stringArray(forKey: Self.nonPersistentDisplayReferencesKey) ?? []
+        let validNonPersistentReferences = Set(
+            storedNonPersistentReferences.filter(DisplayReferenceProvenance.requiresQuarantine)
         )
+        self.nonPersistentDisplayReferences = validNonPersistentReferences
+        if validNonPersistentReferences != Set(storedNonPersistentReferences) {
+            userDefaults.set(
+                validNonPersistentReferences.sorted(),
+                forKey: Self.nonPersistentDisplayReferencesKey
+            )
+        }
 
         // Tests and migrations can use an isolated defaults suite without
         // registering a real login item. Production still reflects the actual
@@ -332,9 +341,12 @@ class AppSettings: ObservableObject {
         reference: String,
         identityResolution: DisplayPhysicalResolution
     ) {
-        if identityResolution == .ambiguous {
+        if identityResolution == .ambiguous,
+           DisplayReferenceProvenance.requiresQuarantine(reference) {
             markDisplayReferenceAsNonPersistent(reference)
         } else {
+            // Stable canonical and hardware-bearing legacy references must
+            // never inherit quarantine from an older buggy build.
             clearNonPersistentMark(for: reference)
         }
         publishSelectedDisplay(reference, context: .explicitDisplay)
@@ -395,9 +407,9 @@ class AppSettings: ObservableObject {
 
     /// Switches to a profile, updating the preferred anchor. Profiles contain
     /// persisted references, not current-runtime clicks: an ambiguous profile
-    /// must therefore use the configured fallback. Explicit activation records
-    /// ambiguity provenance before publishing the anchor change so a later port
-    /// or topology change cannot promote the selector into physical identity.
+    /// must therefore use the configured fallback. Only an ambiguous raw UUID
+    /// or runtime selector receives quarantine provenance. An established
+    /// canonical identity remains eligible for restored serial/alias evidence.
     ///
     /// Tests pass a fixture snapshot through `using`; production uses the same
     /// reconciled snapshot owned by `DockMonitor`.
@@ -411,8 +423,12 @@ class AppSettings: ObservableObject {
             profile.anchorDisplayUUID,
             excludingInferredReferences: nonPersistentDisplayReferences
         )
-        if case .ambiguous = resolution {
+        if case .ambiguous = resolution,
+           DisplayReferenceProvenance.requiresQuarantine(profile.anchorDisplayUUID) {
             markDisplayReferenceAsNonPersistent(profile.anchorDisplayUUID)
+        } else if !DisplayReferenceProvenance.requiresQuarantine(profile.anchorDisplayUUID) {
+            // Repair provenance written for stable references by earlier builds.
+            clearNonPersistentMark(for: profile.anchorDisplayUUID)
         }
 
         activeProfileID = profile.id

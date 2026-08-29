@@ -358,7 +358,8 @@ struct DisplayReconciliationSnapshot {
         // that snapshot, not a newly discovered UUID alias. Keep that provenance
         // across refreshes so one-to-one model elimination after a port/topology
         // change cannot silently promote the choice to a physical identity.
-        if excludingInferredReferences.contains(rawReference) {
+        if excludingInferredReferences.contains(rawReference),
+           DisplayReferenceProvenance.requiresQuarantine(rawReference) {
             return quarantinedResolution(for: parsed)
         }
 
@@ -1047,6 +1048,21 @@ private struct DisplayReference {
     )
 }
 
+/// Ambiguity provenance is reserved for values which select a runtime in the
+/// current snapshot. Canonical and hardware-bearing legacy references describe
+/// persisted identity and must remain eligible for stronger evidence after a
+/// temporary ambiguous refresh.
+enum DisplayReferenceProvenance {
+    static func requiresQuarantine(_ rawReference: String) -> Bool {
+        switch DisplayReference.parse(rawReference).kind {
+        case .bareUUID, .runtime:
+            return true
+        case .canonical, .serial, .vendorModel, .malformed:
+            return false
+        }
+    }
+}
+
 private struct DisplayModelScope: Hashable, Comparable {
     let vendorID: UInt32
     let productID: UInt32
@@ -1461,68 +1477,163 @@ enum DisplayReconciler {
         var aliasesByRuntime: [Set<String>]
     }
 
+    private struct RuntimeMetadataEvidence {
+        let serialKey: DisplayHardwareKey?
+        let aliases: Set<String>
+    }
+
     private static func reconcileMetadata(
         runtimes: [DisplayRuntimeObservation],
         metadata: [DisplayMetadataObservation],
         invalidSerialKeys: Set<DisplayHardwareKey>
     ) -> MetadataResult {
         var assignments = Array(repeating: [String: Int](), count: runtimes.count)
-        var aliases = runtimes.map { runtime in
-            Set(runtime.uuidAlias.flatMap(DisplayReference.normalizedUUIDAlias).map { [$0] } ?? [])
-        }
         let sourceGroups = Dictionary(grouping: metadata.indices, by: { metadata[$0].source })
 
-        for source in sourceGroups.keys.sorted() {
-            let sourceMetadata = sourceGroups[source, default: []].sorted {
-                if metadata[$0].sourceID != metadata[$1].sourceID {
-                    return metadata[$0].sourceID < metadata[$1].sourceID
+        // A source can establish evidence needed to associate a record in a
+        // different source. For example, UUID-bearing IOKit records can teach
+        // the scoped serial for each serialless runtime, after which UUID-less
+        // profiler records (and their friendly names) become uniquely
+        // attributable by serial. Add only assignments forced in every optimal
+        // one-to-one matching, then recompute evidence and continue to a fixed
+        // point. Assignments are applied simultaneously per round so source
+        // names and input ordering cannot influence the result.
+        while true {
+            let evidence = runtimeMetadataEvidence(
+                runtimes: runtimes,
+                metadata: metadata,
+                assignments: assignments,
+                invalidSerialKeys: invalidSerialKeys
+            )
+            var additions: [(runtimeIndex: Int, source: String, metadataIndex: Int)] = []
+
+            for source in sourceGroups.keys.sorted() {
+                let alreadyAssignedRuntimes = Set(runtimes.indices.filter {
+                    assignments[$0][source] != nil
+                })
+                let alreadyAssignedMetadata = Set(assignments.compactMap { $0[source] })
+                let remainingRuntimes = runtimes.indices.filter {
+                    !alreadyAssignedRuntimes.contains($0)
                 }
-                return metadataSortKey(metadata[$0]) < metadataSortKey(metadata[$1])
-            }
-            var edges: [MatchEdge] = []
-            for runtimeIndex in runtimes.indices {
-                for localMetadataIndex in sourceMetadata.indices {
-                    let metadataIndex = sourceMetadata[localMetadataIndex]
-                    if let strength = metadataMatchStrength(
-                        runtime: runtimes[runtimeIndex],
-                        metadata: metadata[metadataIndex],
-                        invalidSerialKeys: invalidSerialKeys
-                    ) {
-                        edges.append(MatchEdge(
-                            left: runtimeIndex,
-                            right: localMetadataIndex,
-                            strength: strength
-                        ))
+                let remainingMetadata = sourceGroups[source, default: []].filter {
+                    !alreadyAssignedMetadata.contains($0)
+                }.sorted {
+                    if metadata[$0].sourceID != metadata[$1].sourceID {
+                        return metadata[$0].sourceID < metadata[$1].sourceID
+                    }
+                    return metadataSortKey(metadata[$0]) < metadataSortKey(metadata[$1])
+                }
+
+                guard !remainingRuntimes.isEmpty, !remainingMetadata.isEmpty else { continue }
+
+                var edges: [MatchEdge] = []
+                for localRuntimeIndex in remainingRuntimes.indices {
+                    let runtimeIndex = remainingRuntimes[localRuntimeIndex]
+                    for localMetadataIndex in remainingMetadata.indices {
+                        let metadataIndex = remainingMetadata[localMetadataIndex]
+                        if let strength = metadataMatchStrength(
+                            runtime: runtimes[runtimeIndex],
+                            runtimeEvidence: evidence[runtimeIndex],
+                            metadata: metadata[metadataIndex],
+                            invalidSerialKeys: invalidSerialKeys
+                        ) {
+                            edges.append(MatchEdge(
+                                left: localRuntimeIndex,
+                                right: localMetadataIndex,
+                                strength: strength
+                            ))
+                        }
                     }
                 }
+
+                let possibilities = MaximumWeightMatcher.possibilities(
+                    leftCount: remainingRuntimes.count,
+                    rightCount: remainingMetadata.count,
+                    edges: edges
+                )
+                for localRuntimeIndex in remainingRuntimes.indices {
+                    guard possibilities.possibleRightsByLeft[localRuntimeIndex].count == 1,
+                          !possibilities.nilPossibleByLeft[localRuntimeIndex],
+                          let localMetadataIndex = possibilities
+                            .possibleRightsByLeft[localRuntimeIndex].first else {
+                        continue
+                    }
+                    additions.append((
+                        runtimeIndex: remainingRuntimes[localRuntimeIndex],
+                        source: source,
+                        metadataIndex: remainingMetadata[localMetadataIndex]
+                    ))
+                }
             }
-            let possibilities = MaximumWeightMatcher.possibilities(
-                leftCount: runtimes.count,
-                rightCount: sourceMetadata.count,
-                edges: edges
-            )
-            for runtimeIndex in runtimes.indices {
-                guard possibilities.possibleRightsByLeft[runtimeIndex].count == 1,
-                      !possibilities.nilPossibleByLeft[runtimeIndex],
-                      let localIndex = possibilities.possibleRightsByLeft[runtimeIndex].first else {
-                    continue
+
+            guard !additions.isEmpty else { break }
+            for addition in additions.sorted(by: {
+                if $0.source != $1.source { return $0.source < $1.source }
+                if $0.runtimeIndex != $1.runtimeIndex {
+                    return $0.runtimeIndex < $1.runtimeIndex
                 }
-                let metadataIndex = sourceMetadata[localIndex]
-                assignments[runtimeIndex][source] = metadataIndex
-                if let alias = metadata[metadataIndex].uuidAlias
-                    .flatMap(DisplayReference.normalizedUUIDAlias) {
-                    aliases[runtimeIndex].insert(alias)
-                }
+                return $0.metadataIndex < $1.metadataIndex
+            }) {
+                assignments[addition.runtimeIndex][addition.source] = addition.metadataIndex
             }
         }
+
+        let finalEvidence = runtimeMetadataEvidence(
+            runtimes: runtimes,
+            metadata: metadata,
+            assignments: assignments,
+            invalidSerialKeys: invalidSerialKeys
+        )
         return MetadataResult(
             uniquelyAssignedMetadataByRuntime: assignments,
-            aliasesByRuntime: aliases
+            aliasesByRuntime: finalEvidence.map(\.aliases)
         )
+    }
+
+    private static func runtimeMetadataEvidence(
+        runtimes: [DisplayRuntimeObservation],
+        metadata: [DisplayMetadataObservation],
+        assignments: [[String: Int]],
+        invalidSerialKeys: Set<DisplayHardwareKey>
+    ) -> [RuntimeMetadataEvidence] {
+        runtimes.indices.map { runtimeIndex in
+            let runtime = runtimes[runtimeIndex]
+            var aliases = Set(
+                runtime.uuidAlias.flatMap(DisplayReference.normalizedUUIDAlias).map { [$0] } ?? []
+            )
+            var serials = Set<DisplayHardwareKey>()
+            if let key = serialKey(
+                vendorID: runtime.vendorID,
+                productID: runtime.productID,
+                serialNumber: runtime.serialNumber
+            ), !invalidSerialKeys.contains(key) {
+                serials.insert(key)
+            }
+
+            for metadataIndex in assignments[runtimeIndex].values {
+                let record = metadata[metadataIndex]
+                if let alias = record.uuidAlias.flatMap(DisplayReference.normalizedUUIDAlias) {
+                    aliases.insert(alias)
+                }
+                if let key = serialKey(
+                    vendorID: record.vendorID,
+                    productID: record.productID,
+                    serialNumber: record.serialNumber
+                ), !invalidSerialKeys.contains(key) {
+                    serials.insert(key)
+                }
+            }
+
+            return RuntimeMetadataEvidence(
+                serialKey: serials.count == 1 ? serials.first : nil,
+                aliases: aliases
+            )
+        }
     }
 
     private static func metadataMatchStrength(
         runtime: DisplayRuntimeObservation,
+        runtimeEvidence: RuntimeMetadataEvidence,
         metadata: DisplayMetadataObservation,
         invalidSerialKeys: Set<DisplayHardwareKey>
     ) -> Int? {
@@ -1533,27 +1644,21 @@ enum DisplayReconciler {
             rhsProduct: metadata.productID
         ) else { return nil }
 
-        let runtimeSerial = serialKey(
-            vendorID: runtime.vendorID,
-            productID: runtime.productID,
-            serialNumber: runtime.serialNumber
-        ).flatMap { invalidSerialKeys.contains($0) ? nil : $0 }
         let metadataSerial = serialKey(
             vendorID: metadata.vendorID,
             productID: metadata.productID,
             serialNumber: metadata.serialNumber
         ).flatMap { invalidSerialKeys.contains($0) ? nil : $0 }
 
-        if let runtimeSerial, let metadataSerial {
+        if let runtimeSerial = runtimeEvidence.serialKey, let metadataSerial {
             if runtimeSerial == metadataSerial { return 3 }
             // Both sources claim a different strong serial for this candidate.
             // Neither a UUID nor presentation data may override that conflict.
             return nil
         }
 
-        if let runtimeAlias = runtime.uuidAlias.flatMap(DisplayReference.normalizedUUIDAlias),
-           let metadataAlias = metadata.uuidAlias.flatMap(DisplayReference.normalizedUUIDAlias),
-           runtimeAlias == metadataAlias {
+        if let metadataAlias = metadata.uuidAlias.flatMap(DisplayReference.normalizedUUIDAlias),
+           runtimeEvidence.aliases.contains(metadataAlias) {
             return 2
         }
 
@@ -1925,13 +2030,13 @@ enum DisplayReconciler {
             }
         }
 
-        // Exact serial matches can leave one runtime and one record from a
-        // complete metadata source as the only possible one-to-one pair. If
-        // that residual pair reports different serials, discarding the metadata
-        // record and trusting the runtime serial would turn conflicting evidence
-        // into a stable identity. Suppress both serials instead. Requiring equal,
-        // fully serial-bearing model groups ensures that missing metadata is not
-        // mistaken for a conflict.
+        // Exact serial matches can leave one or more runtimes and records from
+        // a complete metadata source as residual one-to-one candidates. If the
+        // remaining serial multisets differ, every assignment of those residual
+        // records contains conflicting evidence. Suppress all unmatched serials
+        // rather than trusting whichever source happens to be read first.
+        // Requiring equal, fully serial-bearing model groups ensures that missing
+        // metadata is not mistaken for a conflict.
         let invalidBeforeResidualElimination = invalid
         var residualConflicts = Set<DisplayHardwareKey>()
         let metadataBySource = Dictionary(grouping: metadata, by: \.source)
@@ -1980,12 +2085,19 @@ enum DisplayReconciler {
                 }
                 let remainingRuntime = runtimeKeys.filter { !uniquelyMatchedKeys.contains($0) }
                 let remainingMetadata = metadataKeys.filter { !uniquelyMatchedKeys.contains($0) }
+                let remainingRuntimeCounts = Dictionary(
+                    grouping: remainingRuntime,
+                    by: { $0 }
+                ).mapValues(\.count)
+                let remainingMetadataCounts = Dictionary(
+                    grouping: remainingMetadata,
+                    by: { $0 }
+                ).mapValues(\.count)
 
-                guard remainingRuntime.count == 1,
-                      remainingMetadata.count == 1,
-                      remainingRuntime[0] != remainingMetadata[0] else { continue }
-                residualConflicts.insert(remainingRuntime[0])
-                residualConflicts.insert(remainingMetadata[0])
+                guard !remainingRuntime.isEmpty,
+                      remainingRuntimeCounts != remainingMetadataCounts else { continue }
+                residualConflicts.formUnion(remainingRuntime)
+                residualConflicts.formUnion(remainingMetadata)
             }
         }
         invalid.formUnion(residualConflicts)
