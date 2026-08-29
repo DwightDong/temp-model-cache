@@ -565,8 +565,9 @@ struct ContentView: View {
             }
             // Update available displays
             dockMonitor.updateAvailableDisplays()
-            // Set the anchor display from settings (using UUID for stable identification)
-            dockMonitor.changeAnchorDisplay(toUUID: appSettings.selectedDisplayUUID)
+            // Reapply persistence as restoration, never as an explicit click
+            // on whichever ambiguous display currently owns the old alias.
+            dockMonitor.restorePersistedAnchor()
         }
         .onChange(of: appSettings.selectedDisplayUUID) { oldValue, newValue in
             dockMonitor.changeAnchorDisplay(toUUID: newValue)

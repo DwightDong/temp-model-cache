@@ -86,13 +86,9 @@ class DockMonitor: NSObject, ObservableObject {
         }
     }
 
-    /// Resolves a persisted reference only when the snapshot has one physical
-    /// answer. An exact DisplayInfo match additionally permits an explicit
-    /// selection of an otherwise ambiguous display for this snapshot.
+    /// Resolves persisted identity only. Explicit selection of a current
+    /// ambiguous display goes through `changeAnchorDisplay`, never this lookup.
     func getDisplayID(forUUID uuid: String) -> CGDirectDisplayID? {
-        if let exact = availableDisplays.first(where: { $0.uuid == uuid }) {
-            return exact.id
-        }
         if case let .resolved(runtimeID, _) = reconciliationSnapshot.resolve(uuid) {
             return CGDirectDisplayID(runtimeID)
         }
@@ -132,7 +128,7 @@ class DockMonitor: NSObject, ObservableObject {
     private func setupInitialState() {
         // Initialize with a runtime observation; the first complete snapshot
         // immediately replaces this with a reconciled effective identity.
-        anchorDisplayUUID = Self.getRawDisplayUUID(for: CGMainDisplayID())
+        anchorDisplayUUID = Self.getCurrentDisplayReference(for: CGMainDisplayID())
         updateAvailableDisplays()
         detectCurrentDockPosition()
         setupDisplayConfigurationMonitoring()
@@ -169,7 +165,7 @@ class DockMonitor: NSObject, ObservableObject {
     /// Gets the reconciled reference for the current main display.
     func getMainDisplayUUID() -> String {
         availableDisplays.first { $0.id == CGMainDisplayID() }?.uuid
-            ?? Self.getRawDisplayUUID(for: CGMainDisplayID())
+            ?? Self.getCurrentDisplayReference(for: CGMainDisplayID())
     }
 
     /// Gets the appropriate default anchor display UUID based on user settings
@@ -181,6 +177,15 @@ class DockMonitor: NSObject, ObservableObject {
         case .main:
             return getMainDisplayUUID()
         }
+    }
+
+    private func getDefaultAnchorDisplayID() -> CGDirectDisplayID? {
+        if AppSettings.shared.defaultAnchorDisplay == .builtIn,
+           let builtIn = availableDisplays.first(where: { $0.isBuiltIn }) {
+            return builtIn.id
+        }
+        return availableDisplays.first(where: { $0.id == CGMainDisplayID() })?.id
+            ?? availableDisplays.first?.id
     }
 
     /// Re-evaluates the effective fallback without modifying the preferred
@@ -205,34 +210,89 @@ class DockMonitor: NSObject, ObservableObject {
     }
 
     private func validateCurrentAnchorDisplay() {
-        let fallbackReference = getDefaultAnchorDisplayUUID()
-        let fallbackRuntimeID = availableDisplays.first { $0.uuid == fallbackReference }
-            .map { UInt64($0.id) }
+        _ = applyAnchorReference(
+            AppSettings.shared.selectedDisplayUUID,
+            intent: .persistedPreference,
+            announceChange: false
+        )
+    }
+
+    /// Reapplies the saved value without granting it the privileges of an
+    /// explicit click. This is the launch/view-appearance path: an ambiguous
+    /// value uses fallback and does not permit automatic relocation.
+    @discardableResult
+    func restorePersistedAnchor() -> DisplayAnchorDecision {
+        applyAnchorReference(
+            AppSettings.shared.selectedDisplayUUID,
+            intent: .persistedPreference,
+            announceChange: false
+        )
+    }
+
+    @discardableResult
+    private func applyAnchorReference(
+        _ reference: String,
+        intent: DisplayAnchorSelectionIntent,
+        announceChange: Bool
+    ) -> DisplayAnchorDecision {
         let decision = DisplayAnchorResolver.resolve(
-            preferredReference: AppSettings.shared.selectedDisplayUUID,
-            fallbackRuntimeID: fallbackRuntimeID,
-            snapshot: reconciliationSnapshot
+            preferredReference: reference,
+            fallbackRuntimeID: getDefaultAnchorDisplayID().map { UInt64($0) },
+            snapshot: reconciliationSnapshot,
+            intent: intent
         )
 
-        if !decision.usesFallback,
-           let runtimeID = decision.effectiveRuntimeID,
-           let display = availableDisplays.first(where: { $0.id == CGDirectDisplayID(runtimeID) }) {
-            anchorDisplayUUID = display.uuid
-            anchorIdentityState = .unique
-            return
+        guard let runtimeID = decision.effectiveRuntimeID,
+              let display = availableDisplays.first(where: {
+                  $0.id == CGDirectDisplayID(runtimeID)
+              }) else {
+            useConfiguredFallback(state: identityState(for: decision.preferredResolution))
+            return decision
         }
 
-        switch decision.preferredResolution {
-        case .ambiguous: useConfiguredFallback(state: .ambiguous)
-        case .unavailable: useConfiguredFallback(state: .unavailable)
-        case .unresolved: useConfiguredFallback(state: .unresolved)
-        case .resolved: useConfiguredFallback(state: .unavailable)
+        anchorDisplayUUID = display.uuid
+        updateAnchoredDisplayName()
+        if decision.usesFallback {
+            useConfiguredFallback(
+                state: identityState(for: decision.preferredResolution),
+                display: display
+            )
+        } else if decision.isTemporaryExplicitSelection {
+            anchorIdentityState = .ambiguous
+            if announceChange {
+                statusMessage = "Anchor changed to \(anchoredDisplay) (physical identity ambiguous)"
+            }
+        } else {
+            anchorIdentityState = .unique
+            if announceChange {
+                statusMessage = "Anchor changed to \(anchoredDisplay)"
+            }
+        }
+        return decision
+    }
+
+    private func identityState(for resolution: DisplayReferenceResolution) -> AnchorIdentityState {
+        switch resolution {
+        case .resolved: return .unique
+        case .unavailable: return .unavailable
+        case .ambiguous: return .ambiguous
+        case .unresolved: return .unresolved
         }
     }
 
-    private func useConfiguredFallback(state: AnchorIdentityState) {
+    private func useConfiguredFallback(
+        state: AnchorIdentityState,
+        display: DisplayInfo? = nil
+    ) {
         anchorIdentityState = state
-        anchorDisplayUUID = getDefaultAnchorDisplayUUID()
+        if let display = display
+            ?? getDefaultAnchorDisplayID().flatMap({ defaultID in
+                availableDisplays.first { $0.id == defaultID }
+            }) {
+            anchorDisplayUUID = display.uuid
+        } else {
+            anchorDisplayUUID = getDefaultAnchorDisplayUUID()
+        }
         updateAnchoredDisplayName()
         let defaultName = AppSettings.shared.defaultAnchorDisplay == .builtIn ? "Built-in" : "Primary"
         switch state {
@@ -253,36 +313,17 @@ class DockMonitor: NSObject, ObservableObject {
         }
     }
 
-    /// Changes the effective display. Exact current-snapshot values permit an
-    /// explicit temporary choice even if physical identity is ambiguous. The
-    /// persisted preference is never rewritten to a fallback here.
-    func changeAnchorDisplay(toUUID uuid: String) {
-        if let exact = availableDisplays.first(where: { $0.uuid == uuid }) {
-            anchorDisplayUUID = exact.uuid
-            anchorIdentityState = exact.identityResolution == .unique ? .unique : .ambiguous
-            updateAnchoredDisplayName()
-            statusMessage = exact.identityResolution == .unique
-                ? "Anchor changed to \(anchoredDisplay)"
-                : "Anchor changed to \(anchoredDisplay) (physical identity ambiguous)"
-        } else if case let .resolved(runtimeID, _) = reconciliationSnapshot.resolve(uuid),
-                  let display = availableDisplays.first(where: { $0.id == CGDirectDisplayID(runtimeID) }) {
-            anchorDisplayUUID = display.uuid
-            anchorIdentityState = .unique
-            updateAnchoredDisplayName()
-            statusMessage = "Anchor changed to \(anchoredDisplay)"
-        } else {
-            let state = displayIdentityState(for: uuid)
-            useConfiguredFallback(state: state)
-        }
-
-        DispatchQueue.main.asyncAfter(deadline: .now() + 3.0) { [weak self] in
-            guard let self = self else { return }
-            if self.isActive {
-                self.statusMessage = "Dock Anchor Active - Monitoring mouse movement"
-            } else {
-                self.statusMessage = "Dock Anchor Ready"
-            }
-        }
+    /// An explicit UI/menu selection may temporarily target an ambiguous
+    /// current display, but it never establishes a persistent alias.
+    @discardableResult
+    func changeAnchorDisplay(toUUID uuid: String) -> DisplayAnchorDecision {
+        let decision = applyAnchorReference(
+            uuid,
+            intent: .explicitUserSelection,
+            announceChange: true
+        )
+        resetStatusMessage(after: 3.0)
+        return decision
     }
 
     func changeAnchorDisplay(to displayID: CGDirectDisplayID) {
@@ -796,11 +837,13 @@ class DockMonitor: NSObject, ObservableObject {
     
     private static let identityRegistryDefaultsKey = "displayIdentityRegistryV2"
 
-    private static func getRawDisplayUUID(for displayID: CGDirectDisplayID) -> String {
-        if let uuid = CGDisplayCreateUUIDFromDisplayID(displayID) {
-            return CFUUIDCreateString(nil, uuid.takeRetainedValue()) as String
-        }
-        return "DisplayID-\(displayID)"
+    private static func getDisplayUUIDAlias(for displayID: CGDirectDisplayID) -> String? {
+        guard let uuid = CGDisplayCreateUUIDFromDisplayID(displayID) else { return nil }
+        return CFUUIDCreateString(nil, uuid.takeRetainedValue()) as String
+    }
+
+    private static func getCurrentDisplayReference(for displayID: CGDirectDisplayID) -> String {
+        getDisplayUUIDAlias(for: displayID) ?? "DisplayID-\(displayID)"
     }
 
     private static func loadIdentityRegistry() -> DisplayIdentityRegistry {
@@ -835,7 +878,7 @@ class DockMonitor: NSObject, ObservableObject {
         let runtimes = displayIDs.map { displayID in
             DisplayRuntimeObservation(
                 runtimeID: UInt64(displayID),
-                uuidAlias: Self.getRawDisplayUUID(for: displayID),
+                uuidAlias: Self.getDisplayUUIDAlias(for: displayID),
                 vendorID: CGDisplayVendorNumber(displayID),
                 productID: CGDisplayModelNumber(displayID),
                 serialNumber: CGDisplaySerialNumber(displayID) == 0
@@ -1151,8 +1194,11 @@ class DockMonitor: NSObject, ObservableObject {
                        mouseLocation.y >= frame.minY && mouseLocation.y <= frame.maxY
             }
             
-            if let screen = screen {
-                return CGDirectDisplayID(screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? UInt32 ?? 0)
+            if let screen = screen,
+               let screenNumber = screen.deviceDescription[
+                   NSDeviceDescriptionKey("NSScreenNumber")
+               ] as? UInt32 {
+                return CGDirectDisplayID(screenNumber)
             }
         }
         
@@ -1181,39 +1227,39 @@ class DockMonitor: NSObject, ObservableObject {
                 self.updateAvailableDisplays()
 
                 let connectedRuntimeID = UInt64(displayID)
-                let connectedDisplay = self.reconciliationSnapshot.display(runtimeID: connectedRuntimeID)
-                let connectedIsUnique = connectedDisplay?.resolution == .unique
+                let settings = AppSettings.shared
+                let hotPlugDecision = DisplayHotPlugResolver.displayAdded(
+                    runtimeID: connectedRuntimeID,
+                    preferredReference: settings.selectedDisplayUUID,
+                    profileReferences: settings.profiles.map(\.anchorDisplayUUID),
+                    profileAutoActivation: settings.profiles.map(\.autoActivate),
+                    currentAnchorIsUnique: self.anchorIdentityState == .unique,
+                    autoRelocate: settings.autoRelocateDock,
+                    snapshot: self.reconciliationSnapshot
+                )
                 var profileActivated = false
 
-                if connectedIsUnique,
-                   let profile = AppSettings.shared.findAutoActivateProfile(
-                    forRuntimeDisplayID: connectedRuntimeID,
-                    snapshot: self.reconciliationSnapshot
-                   ) {
+                if let profileIndex = hotPlugDecision.autoActivateProfileIndex {
+                    let profile = settings.profiles[profileIndex]
                     let currentAnchorMatchesProfile =
-                        AppSettings.shared.selectedDisplayUUID == profile.anchorDisplayUUID
-                    if AppSettings.shared.activeProfileID != profile.id || !currentAnchorMatchesProfile {
-                        AppSettings.shared.switchToProfile(profile)
+                        settings.selectedDisplayUUID == profile.anchorDisplayUUID
+                    if settings.activeProfileID != profile.id || !currentAnchorMatchesProfile {
+                        settings.switchToProfile(profile)
                         self.statusMessage = "Auto-activated profile: \(profile.name)"
                         profileActivated = true
                     }
                 }
 
-                if !profileActivated,
-                   case let .resolved(preferredRuntimeID, _) = self.reconciliationSnapshot.resolve(
-                    AppSettings.shared.selectedDisplayUUID
-                   ), preferredRuntimeID == connectedRuntimeID {
+                if !profileActivated && hotPlugDecision.restoresPreferredAnchor {
                     self.statusMessage = "Preferred display reconnected - restoring anchor to \(self.anchoredDisplay)"
-                } else if connectedDisplay?.resolution == .ambiguous {
+                } else if hotPlugDecision.isAmbiguous {
                     self.statusMessage = "Ambiguous display identity - preserving the preferred anchor"
                 }
 
-                // Never relocate because an ambiguous connected display happened
-                // to be enumerated first.
-                if !profileActivated,
-                   connectedIsUnique,
-                   self.anchorIdentityState == .unique,
-                   AppSettings.shared.autoRelocateDock {
+                // Identity-dependent side effects all use the same snapshot
+                // decision. Ambiguous additions can neither activate a profile
+                // nor cause relocation.
+                if !profileActivated && hotPlugDecision.permitsAutomaticRelocation {
                     DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { [weak self] in
                         self?.relocateDockToAnchoredDisplay()
                     }

@@ -9,7 +9,7 @@ private let uuidD = "DDDDDDDD-DDDD-4DDD-8DDD-DDDDDDDDDDDD"
 
 private func runtime(
     _ id: UInt64,
-    _ uuid: String,
+    _ uuid: String?,
     vendor: UInt32 = 100,
     product: UInt32 = 10,
     serial: UInt32? = nil,
@@ -349,6 +349,17 @@ struct DisplayIdentityReconciliationTests {
             !$0.legacyReferences.contains("DisplayID-20") &&
             !$0.legacyReferences.contains("DisplayID-20-SN999")
         })
+
+        let laterDuplicate = DisplayReconciler.reconcile(
+            runtimes: [
+                runtime(300, uuidC, vendor: 200, product: 20),
+                runtime(400, uuidD, vendor: 200, product: 20)
+            ],
+            metadata: [],
+            priorRegistry: registryWithHistory
+        )
+        #expect(laterDuplicate.resolve(uniqueModelLegacy) ==
+            .ambiguous(candidateRuntimeIDs: [300, 400]))
     }
 
     @Test("legacy profiles decode and migration preserves all profile fields")
@@ -517,4 +528,322 @@ struct DisplayIdentityReconciliationTests {
         #expect(repeated.registry == snapshot.registry)
         #expect(snapshotSignature(repeated) == snapshotSignature(snapshot))
     }
+    @Test("runtime selectors migrate only while present and never persist as aliases")
+    func runtimeSelectorsAreSnapshotOnly() throws {
+        let snapshot = reconcileEveryPermutation(
+            runtimes: [runtime(77, "DisplayID-77", vendor: 300, product: 30)],
+            metadata: [
+                metadata(
+                    "iokit",
+                    "runtime-shaped-alias",
+                    "DisplayID-77",
+                    vendor: 300,
+                    product: 30
+                )
+            ],
+            prior: DisplayIdentityRegistry(records: [
+                DisplayIdentityRecord(
+                    canonicalID: "DockAnchorDisplay-V999M99",
+                    vendorID: 999,
+                    productID: 99,
+                    uuidAliases: ["DisplayID-77"],
+                    legacyReferences: ["DisplayID-77-SN9"]
+                ),
+                DisplayIdentityRecord(
+                    canonicalID: "DockAnchorDisplay-UUID-DISPLAYID-77-V300M30",
+                    vendorID: 300,
+                    productID: 30,
+                    uuidAliases: ["DisplayID-77"]
+                )
+            ])
+        )
+        let canonical = snapshot.display(runtimeID: 77)?.identity?.canonicalID
+        #expect(canonical != nil)
+        #expect(snapshot.displays[0].runtime.uuidAlias == nil)
+        #expect(snapshot.registry.records.allSatisfy { record in
+            record.uuidAliases.allSatisfy { !$0.hasPrefix("DisplayID-") } &&
+                record.legacyReferences.allSatisfy { !$0.hasPrefix("DisplayID-") }
+        })
+
+        let forms = ["DisplayID-77", "DisplayID-77-SN999", "DisplayID-77-V300M30"]
+        let migrated = DisplayReferenceMigrator.migrate(references: forms, using: snapshot)
+        #expect(migrated.references == [canonical!, canonical!, canonical!])
+        let withHistory = snapshot.registry.recordingLegacyReferences(migrated.migrations)
+        #expect(withHistory.records.allSatisfy { record in
+            forms.allSatisfy { !record.legacyReferences.contains($0) }
+        })
+
+        let next = DisplayReconciler.reconcile(
+            runtimes: [runtime(88, nil, vendor: 300, product: 30)],
+            metadata: [],
+            priorRegistry: withHistory
+        )
+        for form in forms {
+            #expect(next.resolve(form) == .unavailable)
+        }
+        #expect(next.registry.records.allSatisfy { $0.uuidAliases.isEmpty })
+
+        let encoded = try JSONEncoder().encode(withHistory)
+        let text = String(decoding: encoded, as: UTF8.self)
+        #expect(!text.contains("DisplayID-"))
+    }
+
+    @Test("persisted ambiguous launch selection falls back without relocation")
+    func persistedAmbiguityIsNotAnExplicitSelection() throws {
+        let snapshot = reconcileEveryPermutation(
+            runtimes: [runtime(10, uuidA), runtime(20, uuidB)],
+            metadata: []
+        )
+        let suiteName = "DockAnchorTests.ambiguous-launch.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suiteName)!
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let profileID = UUID()
+        let profile = DockProfile(
+            id: profileID,
+            name: "Ambiguous B",
+            anchorDisplayUUID: uuidB,
+            createdAt: Date(timeIntervalSinceReferenceDate: 123),
+            autoActivate: true
+        )
+        defaults.set(uuidB, forKey: "selectedDisplayUUID")
+        defaults.set(try JSONEncoder().encode([profile]), forKey: "dockProfiles")
+        defaults.set(profileID.uuidString, forKey: "activeProfileID")
+        let settings = AppSettings(
+            userDefaults: defaults,
+            manageLoginItem: false,
+            mainDisplayReference: uuidA
+        )
+        #expect(settings.reconcileDisplayReferences(using: snapshot).isEmpty)
+        #expect(settings.selectedDisplayUUID == uuidB)
+        #expect(settings.profiles == [profile])
+        #expect(settings.activeProfileID == profileID)
+
+        let restored = DisplayAnchorResolver.resolve(
+            preferredReference: uuidB,
+            fallbackRuntimeID: 10,
+            snapshot: snapshot,
+            intent: .persistedPreference
+        )
+        #expect(restored.preferredResolution == .ambiguous(candidateRuntimeIDs: [10, 20]))
+        #expect(restored.effectiveRuntimeID == 10)
+        #expect(restored.usesFallback)
+        #expect(!restored.isTemporaryExplicitSelection)
+        #expect(!restored.permitsAutomaticRelocation)
+
+        let explicit = DisplayAnchorResolver.resolve(
+            preferredReference: uuidB,
+            fallbackRuntimeID: 10,
+            snapshot: snapshot,
+            intent: .explicitUserSelection
+        )
+        #expect(explicit.effectiveRuntimeID == 20)
+        #expect(!explicit.usesFallback)
+        #expect(explicit.isTemporaryExplicitSelection)
+        #expect(!explicit.permitsAutomaticRelocation)
+
+        // A later port swap must not turn restoration into another explicit
+        // choice merely because the persisted UUID is still present.
+        let swapped = reconcileEveryPermutation(
+            runtimes: [runtime(110, uuidB), runtime(120, uuidA)],
+            metadata: [],
+            prior: snapshot.registry
+        )
+        let restoredAfterSwap = DisplayAnchorResolver.resolve(
+            preferredReference: uuidB,
+            fallbackRuntimeID: 120,
+            snapshot: swapped,
+            intent: .persistedPreference
+        )
+        #expect(restoredAfterSwap.usesFallback)
+        #expect(restoredAfterSwap.effectiveRuntimeID == 120)
+        #expect(!restoredAfterSwap.permitsAutomaticRelocation)
+        #expect(settings.reconcileDisplayReferences(using: swapped).isEmpty)
+        #expect(settings.selectedDisplayUUID == uuidB)
+        #expect(settings.profiles == [profile])
+        #expect(settings.activeProfileID == profileID)
+    }
+
+    @Test("malformed UUID-based references remain byte-for-byte unresolved")
+    func malformedUUIDReferencesNeverMigrate() {
+        let snapshot = DisplayReconciler.reconcile(
+            runtimes: [runtime(20, uuidB, serial: 222)],
+            metadata: []
+        )
+        let malformed = [
+            "garbage-SN222",
+            "garbage-V100M10",
+            " \(uuidB)",
+            "\(uuidB) ",
+            "\(uuidB)-SN0",
+            "\(uuidB)-SN222junk",
+            "\(uuidB)-V100M10junk",
+            "DisplayID-20-SN0",
+            "DisplayID-20-V0M0",
+            "DisplayID-20-V100M10-extra"
+        ]
+        let migration = DisplayReferenceMigrator.migrate(references: malformed, using: snapshot)
+        #expect(migration.references == malformed)
+        #expect(migration.migrations.isEmpty)
+        for reference in malformed {
+            #expect(snapshot.resolve(reference) == .unresolved)
+        }
+
+        let valid = [
+            "\(uuidB)-SN222",
+            "\(uuidB)-V100M10",
+            "DisplayID-20-SN222",
+            "DisplayID-20-V100M10"
+        ]
+        #expect(DisplayReferenceMigrator.migrate(references: valid, using: snapshot)
+            .references.allSatisfy { $0 == snapshot.display(runtimeID: 20)?.identity?.canonicalID })
+    }
+
+    @Test("AppSettings migrates selected and persisted profile references atomically")
+    func settingsAndProfileMigrationUsesProductionPersistence() throws {
+        let suiteName = "DockAnchorTests.settings-migration.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suiteName)!
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+
+        let legacy = "99999999-9999-4999-8999-999999999999-SN222"
+        let malformed = "garbage-SN222"
+        let activeID = UUID(uuidString: "12345678-1234-4234-8234-123456789012")!
+        let secondID = UUID(uuidString: "87654321-4321-4321-8321-210987654321")!
+        let malformedID = UUID(uuidString: "AAAAAAAA-1234-4234-8234-123456789012")!
+        let profilesJSON = """
+        [
+          {
+            "id": "\(activeID.uuidString)",
+            "name": "Predates Auto Activation",
+            "anchorDisplayUUID": "\(legacy)",
+            "createdAt": 12345
+          },
+          {
+            "id": "\(secondID.uuidString)",
+            "name": "Same Legacy Value",
+            "anchorDisplayUUID": "\(legacy)",
+            "createdAt": 54321,
+            "autoActivate": true
+          },
+          {
+            "id": "\(malformedID.uuidString)",
+            "name": "Malformed",
+            "anchorDisplayUUID": "\(malformed)",
+            "createdAt": 999,
+            "autoActivate": true
+          }
+        ]
+        """.data(using: .utf8)!
+        defaults.set(legacy, forKey: "selectedDisplayUUID")
+        defaults.set(profilesJSON, forKey: "dockProfiles")
+        defaults.set(activeID.uuidString, forKey: "activeProfileID")
+
+        let settings = AppSettings(
+            userDefaults: defaults,
+            manageLoginItem: false,
+            mainDisplayReference: uuidA
+        )
+        let originalProfiles = settings.profiles
+        let snapshot = DisplayReconciler.reconcile(
+            runtimes: [runtime(20, uuidB, serial: 222)],
+            metadata: []
+        )
+        let canonical = snapshot.display(runtimeID: 20)!.identity!.canonicalID
+
+        let migrations = settings.reconcileDisplayReferences(using: snapshot)
+        #expect(migrations == [legacy: canonical])
+        #expect(settings.selectedDisplayUUID == canonical)
+        #expect(settings.profiles.map(\.anchorDisplayUUID) == [canonical, canonical, malformed])
+        #expect(settings.activeProfileID == activeID)
+        #expect(settings.profiles.map(\.id) == originalProfiles.map(\.id))
+        #expect(settings.profiles.map(\.name) == originalProfiles.map(\.name))
+        #expect(settings.profiles.map(\.createdAt) == originalProfiles.map(\.createdAt))
+        #expect(settings.profiles.map(\.autoActivate) == [false, true, true])
+
+        let persistedProfiles = try JSONDecoder().decode(
+            [DockProfile].self,
+            from: defaults.data(forKey: "dockProfiles")!
+        )
+        #expect(defaults.string(forKey: "selectedDisplayUUID") == canonical)
+        #expect(defaults.string(forKey: "activeProfileID") == activeID.uuidString)
+        #expect(persistedProfiles == settings.profiles)
+        #expect(settings.reconcileDisplayReferences(using: snapshot).isEmpty)
+        #expect(settings.findAutoActivateProfile(
+            forRuntimeDisplayID: 20,
+            snapshot: snapshot
+        )?.id == secondID)
+    }
+
+    @Test("hot-plug policy blocks ambiguous profile activation and relocation")
+    func hotPlugUsesSnapshotPolicyBoundary() {
+        let established = DisplayReconciler.reconcile(
+            runtimes: [runtime(1, uuidA, serial: 111), runtime(2, uuidB, serial: 222)],
+            metadata: []
+        )
+        let aID = canonicalBySerial(111, in: established)!
+        let bID = canonicalBySerial(222, in: established)!
+        let unique = DisplayHotPlugResolver.displayAdded(
+            runtimeID: 2,
+            preferredReference: bID,
+            profileReferences: [bID, aID],
+            profileAutoActivation: [true, true],
+            currentAnchorIsUnique: true,
+            autoRelocate: true,
+            snapshot: established
+        )
+        #expect(unique.autoActivateProfileIndex == 0)
+        #expect(unique.restoresPreferredAnchor)
+        #expect(unique.permitsAutomaticRelocation)
+        #expect(!unique.isAmbiguous)
+
+        let ambiguous = reconcileEveryPermutation(
+            runtimes: [runtime(100, uuidC), runtime(200, uuidD)],
+            metadata: [],
+            prior: established.registry
+        )
+        for connectedID: UInt64 in [100, 200] {
+            let decision = DisplayHotPlugResolver.displayAdded(
+                runtimeID: connectedID,
+                preferredReference: bID,
+                profileReferences: [bID, aID],
+                profileAutoActivation: [true, true],
+                currentAnchorIsUnique: true,
+                autoRelocate: true,
+                snapshot: ambiguous
+            )
+            #expect(decision.isAmbiguous)
+            #expect(decision.autoActivateProfileIndex == nil)
+            #expect(!decision.restoresPreferredAnchor)
+            #expect(!decision.permitsAutomaticRelocation)
+        }
+    }
+
+    @Test("equal serial numbers remain distinct across vendor and product scopes")
+    func serialIdentityIsHardwareScoped() {
+        let snapshot = reconcileEveryPermutation(
+            runtimes: [
+                runtime(10, uuidA, vendor: 100, product: 10, serial: 7),
+                runtime(20, uuidB, vendor: 200, product: 20, serial: 7)
+            ],
+            metadata: [
+                metadata("iokit", "scope-b", uuidB, vendor: 200, product: 20, serial: 7),
+                metadata("iokit", "scope-a", uuidA, vendor: 100, product: 10, serial: 7)
+            ]
+        )
+        let aID = snapshot.display(runtimeID: 10)?.identity?.canonicalID
+        let bID = snapshot.display(runtimeID: 20)?.identity?.canonicalID
+        #expect(aID != nil && bID != nil && aID != bID)
+        #expect(snapshot.displays.allSatisfy { $0.resolution == .unique })
+        #expect(snapshot.resolve("\(uuidA)-SN7") ==
+            .resolved(runtimeID: 10, canonicalReference: aID!))
+        #expect(snapshot.resolve("\(uuidB)-SN7") ==
+            .resolved(runtimeID: 20, canonicalReference: bID!))
+
+        let unknownAlias = "EEEEEEEE-EEEE-4EEE-8EEE-EEEEEEEEEEEE-SN7"
+        #expect(snapshot.resolve(unknownAlias) == .ambiguous(candidateRuntimeIDs: [10, 20]))
+        #expect(DisplayReferenceMigrator.migrate(
+            references: [unknownAlias],
+            using: snapshot
+        ).references == [unknownAlias])
+    }
+
 }

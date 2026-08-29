@@ -58,29 +58,32 @@ struct DockProfile: Identifiable, Codable, Equatable {
 class AppSettings: ObservableObject {
     static let shared = AppSettings()
 
+    private let userDefaults: UserDefaults
+    private let managesLoginItem: Bool
+
     @Published var startAtLogin: Bool {
         didSet {
-            UserDefaults.standard.set(startAtLogin, forKey: "startAtLogin")
+            userDefaults.set(startAtLogin, forKey: "startAtLogin")
             updateLoginItem()
         }
     }
     
     @Published var runInBackground: Bool {
         didSet {
-            UserDefaults.standard.set(runInBackground, forKey: "runInBackground")
+            userDefaults.set(runInBackground, forKey: "runInBackground")
         }
     }
     
     @Published var showStatusIcon: Bool {
         didSet {
-            UserDefaults.standard.set(showStatusIcon, forKey: "showStatusIcon")
+            userDefaults.set(showStatusIcon, forKey: "showStatusIcon")
             NotificationCenter.default.post(name: .statusIconVisibilityChanged, object: showStatusIcon)
         }
     }
     
     @Published var hideFromDock: Bool {
         didSet {
-            UserDefaults.standard.set(hideFromDock, forKey: "hideFromDock")
+            userDefaults.set(hideFromDock, forKey: "hideFromDock")
             if oldValue != hideFromDock {
                 // Notify the app to update activation policy
                 NotificationCenter.default.post(name: .dockVisibilityChanged, object: hideFromDock)
@@ -90,20 +93,20 @@ class AppSettings: ObservableObject {
 
     @Published var autoRelocateDock: Bool {
         didSet {
-            UserDefaults.standard.set(autoRelocateDock, forKey: "autoRelocateDock")
+            userDefaults.set(autoRelocateDock, forKey: "autoRelocateDock")
         }
     }
 
     @Published var defaultAnchorDisplay: DefaultAnchorDisplay {
         didSet {
-            UserDefaults.standard.set(defaultAnchorDisplay.rawValue, forKey: "defaultAnchorDisplay")
+            userDefaults.set(defaultAnchorDisplay.rawValue, forKey: "defaultAnchorDisplay")
             NotificationCenter.default.post(name: .defaultAnchorDisplayChanged, object: defaultAnchorDisplay)
         }
     }
 
     @Published var appTheme: AppTheme {
         didSet {
-            UserDefaults.standard.set(appTheme.rawValue, forKey: "appTheme")
+            userDefaults.set(appTheme.rawValue, forKey: "appTheme")
         }
     }
 
@@ -117,9 +120,9 @@ class AppSettings: ObservableObject {
     @Published var activeProfileID: UUID? {
         didSet {
             if let idString = activeProfileID?.uuidString {
-                UserDefaults.standard.set(idString, forKey: "activeProfileID")
+                userDefaults.set(idString, forKey: "activeProfileID")
             } else {
-                UserDefaults.standard.removeObject(forKey: "activeProfileID")
+                userDefaults.removeObject(forKey: "activeProfileID")
             }
         }
     }
@@ -133,7 +136,7 @@ class AppSettings: ObservableObject {
     /// Hardware UUID of the selected anchor display (stable across reboots/cable swaps)
     @Published var selectedDisplayUUID: String {
         didSet {
-            UserDefaults.standard.set(selectedDisplayUUID, forKey: "selectedDisplayUUID")
+            userDefaults.set(selectedDisplayUUID, forKey: "selectedDisplayUUID")
             NotificationCenter.default.post(name: .anchorDisplayChanged, object: selectedDisplayUUID)
         }
     }
@@ -151,29 +154,63 @@ class AppSettings: ObservableObject {
         }
     }
     
-    init() {
-        // Check actual login item status from system
-        let actualLoginStatus = SMAppService.mainApp.status == .enabled
+    init(
+        userDefaults: UserDefaults = .standard,
+        manageLoginItem: Bool = true,
+        mainDisplayReference: String? = nil
+    ) {
+        self.userDefaults = userDefaults
+        self.managesLoginItem = manageLoginItem
+
+        // Tests and migrations can use an isolated defaults suite without
+        // registering a real login item. Production still reflects the actual
+        // SMAppService state.
+        let actualLoginStatus: Bool
+        if manageLoginItem {
+            actualLoginStatus = SMAppService.mainApp.status == .enabled
+        } else {
+            actualLoginStatus = Self.boolPreference(
+                defaults: userDefaults,
+                forKey: "startAtLogin",
+                defaultValue: false
+            )
+        }
         self.startAtLogin = actualLoginStatus
-        
-        self.runInBackground = UserDefaults.standard.object(forKey: "runInBackground") as? Bool ?? true
-        self.showStatusIcon = UserDefaults.standard.object(forKey: "showStatusIcon") as? Bool ?? true
-        self.hideFromDock = UserDefaults.standard.object(forKey: "hideFromDock") as? Bool ?? false
-        self.autoRelocateDock = UserDefaults.standard.object(forKey: "autoRelocateDock") as? Bool ?? true
+
+        self.runInBackground = Self.boolPreference(
+            defaults: userDefaults,
+            forKey: "runInBackground",
+            defaultValue: true
+        )
+        self.showStatusIcon = Self.boolPreference(
+            defaults: userDefaults,
+            forKey: "showStatusIcon",
+            defaultValue: true
+        )
+        self.hideFromDock = Self.boolPreference(
+            defaults: userDefaults,
+            forKey: "hideFromDock",
+            defaultValue: false
+        )
+        self.autoRelocateDock = Self.boolPreference(
+            defaults: userDefaults,
+            forKey: "autoRelocateDock",
+            defaultValue: true
+        )
 
         // Get saved default anchor display or default to main display
-        let savedDefaultAnchor = UserDefaults.standard.string(forKey: "defaultAnchorDisplay") ?? "Main Display"
+        let savedDefaultAnchor = userDefaults.string(forKey: "defaultAnchorDisplay") ?? "Main Display"
         self.defaultAnchorDisplay = DefaultAnchorDisplay(rawValue: savedDefaultAnchor) ?? .main
 
         // Get saved theme or default to system
-        let savedTheme = UserDefaults.standard.string(forKey: "appTheme") ?? "System"
+        let savedTheme = userDefaults.string(forKey: "appTheme") ?? "System"
         self.appTheme = AppTheme(rawValue: savedTheme) ?? .system
 
         // Load saved profiles
-        self.profiles = Self.loadProfiles()
+        self.profiles = Self.loadProfiles(from: userDefaults)
 
         // Load active profile ID
-        if let activeIDString = UserDefaults.standard.string(forKey: "activeProfileID"),
+        if let activeIDString = userDefaults.string(forKey: "activeProfileID"),
            let activeID = UUID(uuidString: activeIDString) {
             self.activeProfileID = activeID
         } else {
@@ -181,9 +218,9 @@ class AppSettings: ObservableObject {
         }
 
         // Get saved display UUID, with migration from old display ID storage
-        if let savedUUID = UserDefaults.standard.string(forKey: "selectedDisplayUUID") {
+        if let savedUUID = userDefaults.string(forKey: "selectedDisplayUUID") {
             self.selectedDisplayUUID = savedUUID
-        } else if let oldDisplayID = UserDefaults.standard.object(forKey: "selectedDisplayID") as? Int {
+        } else if let oldDisplayID = userDefaults.object(forKey: "selectedDisplayID") as? Int {
             // Migrate from old display ID to UUID
             let displayID = CGDirectDisplayID(oldDisplayID)
             if let uuid = CGDisplayCreateUUIDFromDisplayID(displayID) {
@@ -191,18 +228,30 @@ class AppSettings: ObservableObject {
                 self.selectedDisplayUUID = CFUUIDCreateString(nil, uuidRef) as String
             } else {
                 // Fallback to main display UUID
-                self.selectedDisplayUUID = Self.getMainDisplayUUID()
+                self.selectedDisplayUUID = mainDisplayReference ?? Self.getMainDisplayUUID()
             }
         } else {
             // Default to main display UUID
-            self.selectedDisplayUUID = Self.getMainDisplayUUID()
+            self.selectedDisplayUUID = mainDisplayReference ?? Self.getMainDisplayUUID()
         }
         
         // Sync UserDefaults with actual system state
-        UserDefaults.standard.set(actualLoginStatus, forKey: "startAtLogin")
+        userDefaults.set(actualLoginStatus, forKey: "startAtLogin")
     }
     
+    private static func boolPreference(
+        defaults userDefaults: UserDefaults,
+        forKey key: String,
+        defaultValue: Bool
+    ) -> Bool {
+        guard let value = userDefaults.object(forKey: key) as? Bool else {
+            return defaultValue
+        }
+        return value
+    }
+
     private func updateLoginItem() {
+        guard managesLoginItem else { return }
         do {
             if startAtLogin {
                 try SMAppService.mainApp.register()
@@ -318,14 +367,14 @@ class AppSettings: ObservableObject {
     private func saveProfiles() {
         do {
             let data = try JSONEncoder().encode(profiles)
-            UserDefaults.standard.set(data, forKey: "dockProfiles")
+            userDefaults.set(data, forKey: "dockProfiles")
         } catch {
             print("Failed to save profiles: \(error)")
         }
     }
 
-    private static func loadProfiles() -> [DockProfile] {
-        guard let data = UserDefaults.standard.data(forKey: "dockProfiles") else {
+    private static func loadProfiles(from userDefaults: UserDefaults) -> [DockProfile] {
+        guard let data = userDefaults.data(forKey: "dockProfiles") else {
             return []
         }
         do {

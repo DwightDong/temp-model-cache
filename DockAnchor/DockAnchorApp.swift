@@ -121,8 +121,9 @@ class ApplicationDelegate: NSObject, NSApplicationDelegate, ObservableObject {
         // Only perform accessibility-dependent operations if permissions are granted
         let hasPermissions = dockMonitor.requestAccessibilityPermissions()
         if hasPermissions {
-            // Set the anchor display from settings (using UUID for stable identification)
-            dockMonitor.changeAnchorDisplay(toUUID: appSettings.selectedDisplayUUID)
+            // Restore persisted identity without treating it as an explicit
+            // current-display click. Ambiguity must remain on fallback.
+            let anchorDecision = dockMonitor.restorePersistedAnchor()
 
             // Auto-start monitoring if enabled (with a small delay for system stability)
             if appSettings.runInBackground {
@@ -132,7 +133,7 @@ class ApplicationDelegate: NSObject, NSApplicationDelegate, ObservableObject {
             }
 
             // Auto-relocate dock to anchored display on launch if enabled
-            if appSettings.autoRelocateDock {
+            if appSettings.autoRelocateDock && anchorDecision.permitsAutomaticRelocation {
                 DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self] in
                     self?.dockMonitor.relocateDockToAnchoredDisplay()
                 }
