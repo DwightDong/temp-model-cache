@@ -198,17 +198,49 @@ struct DisplayIdentityRegistry: Equatable, Codable {
     func recordingLegacyReferences(_ migrations: [String: String]) -> DisplayIdentityRegistry {
         guard !migrations.isEmpty else { return self }
         var updated = records
-        for (oldReference, canonicalID) in migrations {
-            guard let index = updated.firstIndex(where: { $0.canonicalID == canonicalID }) else { continue }
-            let parsed = DisplayReference.parse(oldReference)
-            // A runtime ID is proof only in the snapshot where migration took
-            // place. Persisting it as an alias would incorrectly resurrect that
-            // association after the operating system reuses the ID.
-            guard DisplayReference.canPersistAsLegacyReference(oldReference) else { continue }
-            updated[index].legacyReferences.insert(oldReference)
-            if let alias = parsed.uuidAlias.flatMap(DisplayReference.normalizedUUIDAlias) {
-                updated[index].uuidAliases.insert(alias)
+
+        // Reconciliation has already atomically assigned every current UUID to
+        // its uniquely resolved physical owner. A serial/vendor migration may
+        // have followed hardware after a port swap, so its legacy UUID prefix
+        // is explicitly not ownership evidence and must never be copied to the
+        // migration target. Doing so would undo the snapshot-level transfer.
+        //
+        // A bare UUID is different: it is useful alias history, but only when
+        // the reconciled registry does not assign it to another identity. Take
+        // this ownership snapshot before adding any history so dictionary
+        // iteration order cannot affect the result.
+        var ownersByAlias: [String: Set<String>] = [:]
+        for record in updated {
+            for alias in record.uuidAliases {
+                ownersByAlias[alias, default: []].insert(record.canonicalID)
             }
+        }
+
+        for oldReference in migrations.keys.sorted() {
+            guard let canonicalID = migrations[oldReference],
+                  let index = updated.firstIndex(where: { $0.canonicalID == canonicalID }),
+                  DisplayReference.canPersistAsLegacyReference(oldReference) else {
+                continue
+            }
+            let parsed = DisplayReference.parse(oldReference)
+
+            if parsed.kind == .bareUUID,
+               let alias = parsed.uuidAlias.flatMap(DisplayReference.normalizedUUIDAlias) {
+                let owners = ownersByAlias[alias, default: []]
+                // Do not create a second exact bare-UUID owner. This guard also
+                // protects registries imported from versions which already
+                // contained duplicate alias history.
+                guard owners.isEmpty || owners == Set([canonicalID]) else { continue }
+                updated[index].uuidAliases.insert(alias)
+                updated[index].legacyReferences.insert(oldReference)
+                ownersByAlias[alias, default: []].insert(canonicalID)
+                continue
+            }
+
+            // Serial and vendor/model legacy values are retained for audit and
+            // idempotence, while resolution deliberately ignores their UUID
+            // prefixes. Current aliases already came from reconciliation.
+            updated[index].legacyReferences.insert(oldReference)
         }
         return DisplayIdentityRegistry(records: updated)
     }

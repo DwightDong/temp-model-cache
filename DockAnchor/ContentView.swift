@@ -576,18 +576,9 @@ struct ContentView: View {
             // on whichever ambiguous display currently owns the old alias.
             dockMonitor.restorePersistedAnchor()
         }
-        .onChange(of: appSettings.selectedDisplayUUID) { oldValue, newValue in
-            let decision = dockMonitor.changeAnchorDisplay(toUUID: newValue)
-            // Auto-move only after unique reconciliation. A temporary explicit
-            // selection may target an ambiguous display, but cannot infer a
-            // physical relocation destination.
-            if appSettings.autoRelocateDock && oldValue != newValue &&
-                decision.permitsAutomaticRelocation {
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
-                    dockMonitor.relocateDockToAnchoredDisplay()
-                }
-            }
-        }
+        // Anchor setting changes are applied by DockMonitor's process-wide
+        // notification observer. Keeping the identity decision there makes
+        // window, menu, profile, and background behavior identical.
     }
     
 }

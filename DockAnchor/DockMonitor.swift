@@ -146,10 +146,28 @@ class DockMonitor: NSObject, ObservableObject {
     
     private func setupNotificationObservers() {
         NotificationCenter.default.publisher(for: .anchorDisplayChanged)
-            .compactMap { $0.object as? String }
+            .compactMap { $0.object as? DisplayAnchorChangeRequest }
             .receive(on: DispatchQueue.main)
-            .sink { [weak self] newDisplayUUID in
-                self?.changeAnchorDisplay(toUUID: newDisplayUUID)
+            .sink { [weak self] request in
+                guard let self = self else { return }
+                let decision = self.applyAnchorReference(
+                    request.reference,
+                    intent: request.selectionIntent,
+                    announceChange: true
+                )
+                self.resetStatusMessage(after: 3.0)
+
+                // Both display clicks and profile activation use this one
+                // ambiguity-aware result. In particular, a profile's ambiguous
+                // UUID remains on the configured fallback and cannot relocate.
+                if request.permitsAutomaticRelocation(
+                    enabled: AppSettings.shared.autoRelocateDock,
+                    decision: decision
+                ) {
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) { [weak self] in
+                        self?.relocateDockToAnchoredDisplay()
+                    }
+                }
             }
             .store(in: &cancellables)
 

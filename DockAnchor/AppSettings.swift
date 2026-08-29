@@ -28,6 +28,40 @@ enum DefaultAnchorDisplay: String, CaseIterable {
     case main = "Main Display"
 }
 
+/// A process-wide anchor update carries its selection semantics with it. This
+/// prevents a persisted profile reference from being reinterpreted as a click
+/// on whichever ambiguous runtime currently exposes the same UUID.
+struct DisplayAnchorChangeRequest: Equatable {
+    let reference: String
+    let selectionIntent: DisplayAnchorSelectionIntent
+    let requestsAutomaticRelocation: Bool
+
+    func permitsAutomaticRelocation(
+        enabled: Bool,
+        decision: DisplayAnchorDecision
+    ) -> Bool {
+        requestsAutomaticRelocation && enabled && decision.permitsAutomaticRelocation
+    }
+}
+
+private struct DisplayAnchorChangeContext {
+    let selectionIntent: DisplayAnchorSelectionIntent
+    let requestsAutomaticRelocation: Bool
+
+    static let persisted = DisplayAnchorChangeContext(
+        selectionIntent: .persistedPreference,
+        requestsAutomaticRelocation: false
+    )
+    static let explicitDisplay = DisplayAnchorChangeContext(
+        selectionIntent: .explicitUserSelection,
+        requestsAutomaticRelocation: true
+    )
+    static let profile = DisplayAnchorChangeContext(
+        selectionIntent: .persistedPreference,
+        requestsAutomaticRelocation: true
+    )
+}
+
 // MARK: - Profile Model
 struct DockProfile: Identifiable, Codable, Equatable {
     var id: UUID
@@ -61,6 +95,7 @@ class AppSettings: ObservableObject {
     private let userDefaults: UserDefaults
     private let managesLoginItem: Bool
     private static let nonPersistentDisplayReferencesKey = "nonPersistentDisplayReferencesV1"
+    private var nextAnchorChangeContext = DisplayAnchorChangeContext.persisted
 
     /// Current-snapshot selectors chosen while physical identity was ambiguous.
     /// These values are persisted only as provenance: they must never be
@@ -143,7 +178,15 @@ class AppSettings: ObservableObject {
     @Published var selectedDisplayUUID: String {
         didSet {
             userDefaults.set(selectedDisplayUUID, forKey: "selectedDisplayUUID")
-            NotificationCenter.default.post(name: .anchorDisplayChanged, object: selectedDisplayUUID)
+            let context = nextAnchorChangeContext
+            NotificationCenter.default.post(
+                name: .anchorDisplayChanged,
+                object: DisplayAnchorChangeRequest(
+                    reference: selectedDisplayUUID,
+                    selectionIntent: context.selectionIntent,
+                    requestsAutomaticRelocation: context.requestsAutomaticRelocation
+                )
+            )
         }
     }
 
@@ -294,7 +337,16 @@ class AppSettings: ObservableObject {
         } else {
             clearNonPersistentMark(for: reference)
         }
+        publishSelectedDisplay(reference, context: .explicitDisplay)
+    }
+
+    private func publishSelectedDisplay(
+        _ reference: String,
+        context: DisplayAnchorChangeContext
+    ) {
+        nextAnchorChangeContext = context
         selectedDisplayUUID = reference
+        nextAnchorChangeContext = .persisted
     }
 
     private func markDisplayReferenceAsNonPersistent(_ reference: String) {
@@ -341,17 +393,31 @@ class AppSettings: ObservableObject {
         }
     }
 
-    /// Switches to a profile, updating the anchor display
-    func switchToProfile(_ profile: DockProfile) {
-        activeProfileID = profile.id
-        selectedDisplayUUID = profile.anchorDisplayUUID
-
-        // Trigger dock relocation if enabled
-        if autoRelocateDock {
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
-                DockMonitor.shared.relocateDockToAnchoredDisplay()
-            }
+    /// Switches to a profile, updating the preferred anchor. Profiles contain
+    /// persisted references, not current-runtime clicks: an ambiguous profile
+    /// must therefore use the configured fallback. Explicit activation records
+    /// ambiguity provenance before publishing the anchor change so a later port
+    /// or topology change cannot promote the selector into physical identity.
+    ///
+    /// Tests pass a fixture snapshot through `using`; production uses the same
+    /// reconciled snapshot owned by `DockMonitor`.
+    @discardableResult
+    func switchToProfile(
+        _ profile: DockProfile,
+        using snapshot: DisplayReconciliationSnapshot? = nil
+    ) -> DisplayReferenceResolution {
+        let currentSnapshot = snapshot ?? DockMonitor.shared.reconciliationSnapshot
+        let resolution = currentSnapshot.resolve(
+            profile.anchorDisplayUUID,
+            excludingInferredReferences: nonPersistentDisplayReferences
+        )
+        if case .ambiguous = resolution {
+            markDisplayReferenceAsNonPersistent(profile.anchorDisplayUUID)
         }
+
+        activeProfileID = profile.id
+        publishSelectedDisplay(profile.anchorDisplayUUID, context: .profile)
+        return resolution
     }
 
     /// Deactivates the current profile (keeps current display setting)

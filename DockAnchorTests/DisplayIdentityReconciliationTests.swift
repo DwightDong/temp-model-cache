@@ -7,6 +7,10 @@ private let uuidB = "BBBBBBBB-BBBB-4BBB-8BBB-BBBBBBBBBBBB"
 private let uuidC = "CCCCCCCC-CCCC-4CCC-8CCC-CCCCCCCCCCCC"
 private let uuidD = "DDDDDDDD-DDDD-4DDD-8DDD-DDDDDDDDDDDD"
 
+private final class AnchorChangeRequestBox: @unchecked Sendable {
+    var value: DisplayAnchorChangeRequest?
+}
+
 private func runtime(
     _ id: UInt64,
     _ uuid: String?,
@@ -1443,6 +1447,220 @@ struct DisplayIdentityReconciliationTests {
         #expect(reloaded.selectedDisplayUUID == bID)
         #expect(reloaded.profiles == settings.profiles)
         #expect(reloaded.activeProfileID == profileB.id)
+    }
+
+    @Test("legacy serial recording cannot reclaim a UUID after a port swap")
+    func migratedLegacySerialDoesNotReintroduceStaleAliasOwnership() throws {
+        let established = reconcileEveryPermutation(
+            runtimes: [
+                runtime(1, uuidA, serial: 111),
+                runtime(2, uuidB, serial: 222)
+            ],
+            metadata: [
+                metadata("iokit", "physical-b", uuidB, serial: 222),
+                metadata("iokit", "physical-a", uuidA, serial: 111)
+            ]
+        )
+        let aID = canonicalBySerial(111, in: established)!
+        let bID = canonicalBySerial(222, in: established)!
+        let legacyB = "\(uuidB)-SN222"
+
+        let suiteName = "DockAnchorTests.migrated-stale-alias.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suiteName)!
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let profileB = DockProfile(
+            id: UUID(uuidString: "BBBBBBBB-5678-4678-8678-123456789012")!,
+            name: "Legacy Physical B",
+            anchorDisplayUUID: legacyB,
+            createdAt: Date(timeIntervalSinceReferenceDate: 222),
+            autoActivate: true
+        )
+        defaults.set(legacyB, forKey: "selectedDisplayUUID")
+        defaults.set(try JSONEncoder().encode([profileB]), forKey: "dockProfiles")
+        defaults.set(profileB.id.uuidString, forKey: "activeProfileID")
+        let settings = AppSettings(
+            userDefaults: defaults,
+            manageLoginItem: false,
+            mainDisplayReference: uuidA
+        )
+
+        // B follows its serial to UUID A while UUID B is atomically assigned to
+        // physical A. This is the same order used by production getAllDisplays:
+        // reconcile, migrate settings, then record migrated legacy references.
+        let swapped = reconcileEveryPermutation(
+            runtimes: [
+                runtime(30, uuidB, serial: 111),
+                runtime(40, uuidA, serial: 222)
+            ],
+            metadata: [
+                metadata("iokit", "b-now-at-a", uuidA, serial: 222),
+                metadata("iokit", "a-now-at-b", uuidB, serial: 111)
+            ],
+            prior: established.registry,
+            validate: { candidate in
+                #expect(candidate.resolve(aID) ==
+                    .resolved(runtimeID: 30, canonicalReference: aID))
+                #expect(candidate.resolve(bID) ==
+                    .resolved(runtimeID: 40, canonicalReference: bID))
+                #expect(candidate.resolve(legacyB) ==
+                    .resolved(runtimeID: 40, canonicalReference: bID))
+            }
+        )
+        let migrations = settings.reconcileDisplayReferences(using: swapped)
+        #expect(migrations == [legacyB: bID])
+        #expect(settings.selectedDisplayUUID == bID)
+        #expect(settings.profiles.first?.anchorDisplayUUID == bID)
+        #expect(settings.activeProfileID == profileB.id)
+
+        let recordedRegistry = swapped.registry.recordingLegacyReferences(migrations)
+        let aRecord = recordedRegistry.records.first { $0.canonicalID == aID }
+        let bRecord = recordedRegistry.records.first { $0.canonicalID == bID }
+        #expect(aRecord?.uuidAliases.contains(uuidB) == true)
+        #expect(bRecord?.uuidAliases.contains(uuidA) == true)
+        #expect(bRecord?.uuidAliases.contains(uuidB) == false)
+        #expect(bRecord?.legacyReferences.contains(legacyB) == true)
+
+        // B now disconnects and A temporarily loses its serial. The stale UUID
+        // prefix saved in legacyB must not make A ambiguous or make B appear
+        // connected. Anchor/profile persistence remains on physical B and the
+        // effective anchor falls back to the sole connected display A.
+        let afterBDisconnects = reconcileEveryPermutation(
+            runtimes: [runtime(300, uuidB, serial: nil)],
+            metadata: [metadata("iokit", "only-a", uuidB, serial: nil)],
+            prior: recordedRegistry,
+            validate: { candidate in
+                #expect(candidate.display(runtimeID: 300)?.identity?.canonicalID == aID)
+                #expect(candidate.resolve(aID) ==
+                    .resolved(runtimeID: 300, canonicalReference: aID))
+                #expect(candidate.resolve(bID) == .unavailable)
+            }
+        )
+        #expect(settings.reconcileDisplayReferences(using: afterBDisconnects).isEmpty)
+        #expect(settings.selectedDisplayUUID == bID)
+        #expect(settings.profiles.first == DockProfile(
+            id: profileB.id,
+            name: profileB.name,
+            anchorDisplayUUID: bID,
+            createdAt: profileB.createdAt,
+            autoActivate: profileB.autoActivate
+        ))
+        #expect(settings.activeProfileID == profileB.id)
+        #expect(settings.findAutoActivateProfile(
+            forRuntimeDisplayID: 300,
+            snapshot: afterBDisconnects
+        ) == nil)
+
+        let fallback = DisplayAnchorResolver.resolve(
+            preferredReference: settings.selectedDisplayUUID,
+            fallbackRuntimeID: 300,
+            snapshot: afterBDisconnects,
+            excludingInferredReferences: settings.nonPersistentDisplayReferences
+        )
+        #expect(fallback.preferredResolution == .unavailable)
+        #expect(fallback.usesFallback)
+        #expect(fallback.effectiveRuntimeID == 300)
+    }
+
+    @Test("manual ambiguous profile activation uses fallback and suppresses relocation")
+    func switchToAmbiguousProfileUsesProductionAnchorPolicy() throws {
+        let profileAlias = "EFEFEFEF-EFEF-4FEF-8FEF-EFEFEFEFEFEF"
+        let ambiguous = reconcileEveryPermutation(
+            runtimes: [runtime(10, uuidA), runtime(20, profileAlias)],
+            metadata: [
+                metadata("profiler", "duplicate-b", vendor: 100, product: 10),
+                metadata("profiler", "duplicate-a", vendor: 100, product: 10)
+            ]
+        )
+        #expect(ambiguous.resolve(profileAlias) ==
+            .ambiguous(candidateRuntimeIDs: [10, 20]))
+
+        let suiteName = "DockAnchorTests.ambiguous-profile-switch.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suiteName)!
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        defaults.set(uuidA, forKey: "selectedDisplayUUID")
+        defaults.set(true, forKey: "autoRelocateDock")
+        let settings = AppSettings(
+            userDefaults: defaults,
+            manageLoginItem: false,
+            mainDisplayReference: uuidA
+        )
+        let profile = DockProfile(
+            id: UUID(uuidString: "BBBBBBBB-9876-4876-8876-123456789012")!,
+            name: "Ambiguous B",
+            anchorDisplayUUID: profileAlias,
+            createdAt: Date(timeIntervalSinceReferenceDate: 987),
+            autoActivate: false
+        )
+        settings.profiles = [profile]
+
+        let requestBox = AnchorChangeRequestBox()
+        let observer = NotificationCenter.default.addObserver(
+            forName: .anchorDisplayChanged,
+            object: nil,
+            queue: nil
+        ) { notification in
+            guard let request = notification.object as? DisplayAnchorChangeRequest,
+                  request.reference == profileAlias else { return }
+            requestBox.value = request
+        }
+        defer { NotificationCenter.default.removeObserver(observer) }
+
+        // Exercise the actual AppSettings entry point used by profile chips and
+        // the menu. It records provenance before publishing a persisted-intent
+        // change request; DockMonitor consumes this exact request.
+        let resolution = settings.switchToProfile(profile, using: ambiguous)
+        #expect(resolution == .ambiguous(candidateRuntimeIDs: [10, 20]))
+        #expect(settings.activeProfileID == profile.id)
+        #expect(settings.selectedDisplayUUID == profileAlias)
+        #expect(settings.profiles == [profile])
+        #expect(settings.nonPersistentDisplayReferences == Set([profileAlias]))
+        #expect(defaults.stringArray(forKey: "nonPersistentDisplayReferencesV1") == [profileAlias])
+
+        let request = requestBox.value
+        #expect(request == DisplayAnchorChangeRequest(
+            reference: profileAlias,
+            selectionIntent: .persistedPreference,
+            requestsAutomaticRelocation: true
+        ))
+        guard let request else { return }
+        let anchorDecision = DisplayAnchorResolver.resolve(
+            preferredReference: request.reference,
+            fallbackRuntimeID: 10,
+            snapshot: ambiguous,
+            intent: request.selectionIntent,
+            excludingInferredReferences: settings.nonPersistentDisplayReferences
+        )
+        #expect(anchorDecision.preferredResolution ==
+            .ambiguous(candidateRuntimeIDs: [10, 20]))
+        #expect(anchorDecision.usesFallback)
+        #expect(anchorDecision.effectiveRuntimeID == 10)
+        #expect(!anchorDecision.isTemporaryExplicitSelection)
+        #expect(!request.permitsAutomaticRelocation(
+            enabled: settings.autoRelocateDock,
+            decision: anchorDecision
+        ))
+
+        // Persisted provenance ensures a later single-candidate topology cannot
+        // infer continuity from this manual profile activation.
+        let oneCandidateLater = DisplayReconciler.reconcile(
+            runtimes: [runtime(200, profileAlias)],
+            metadata: [],
+            priorRegistry: ambiguous.registry
+        )
+        #expect(oneCandidateLater.resolve(profileAlias).isUniquelyResolved)
+        #expect(settings.reconcileDisplayReferences(using: oneCandidateLater).isEmpty)
+        #expect(settings.selectedDisplayUUID == profileAlias)
+        #expect(settings.profiles == [profile])
+        #expect(settings.activeProfileID == profile.id)
+        let restored = DisplayAnchorResolver.resolve(
+            preferredReference: settings.selectedDisplayUUID,
+            fallbackRuntimeID: 200,
+            snapshot: oneCandidateLater,
+            excludingInferredReferences: settings.nonPersistentDisplayReferences
+        )
+        #expect(restored.preferredResolution == .ambiguous(candidateRuntimeIDs: [200]))
+        #expect(restored.usesFallback)
+        #expect(!restored.permitsAutomaticRelocation)
     }
 
     @Test("one-to-one residual serial conflicts are suppressed")
