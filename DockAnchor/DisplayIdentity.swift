@@ -1309,6 +1309,7 @@ enum DisplayReconciler {
         let metadataResult = reconcileMetadata(
             runtimes: runtimes,
             metadata: metadata,
+            priorRecords: prior.records,
             invalidSerialKeys: invalidSerialKeys
         )
 
@@ -1485,6 +1486,7 @@ enum DisplayReconciler {
     private static func reconcileMetadata(
         runtimes: [DisplayRuntimeObservation],
         metadata: [DisplayMetadataObservation],
+        priorRecords: [DisplayIdentityRecord],
         invalidSerialKeys: Set<DisplayHardwareKey>
     ) -> MetadataResult {
         var assignments = Array(repeating: [String: Int](), count: runtimes.count)
@@ -1498,13 +1500,29 @@ enum DisplayReconciler {
         // one-to-one matching, then recompute evidence and continue to a fixed
         // point. Assignments are applied simultaneously per round so source
         // names and input ordering cannot influence the result.
+        //
+        // Current-snapshot evidence is exhausted first because a newly observed
+        // serial must outrank a historical UUID alias. Once no current source can
+        // make progress, one-to-one prior-identity assignments may contribute an
+        // established serial. This preserves names and presentation metadata
+        // when current serial-bearing APIs are temporarily unavailable without
+        // turning a stale UUID into stronger evidence than a current serial.
+        var includePriorIdentityEvidence = false
         while true {
-            let evidence = runtimeMetadataEvidence(
+            let currentEvidence = runtimeMetadataEvidence(
                 runtimes: runtimes,
                 metadata: metadata,
                 assignments: assignments,
                 invalidSerialKeys: invalidSerialKeys
             )
+            let evidence = includePriorIdentityEvidence
+                ? incorporatingPriorIdentityEvidence(
+                    runtimes: runtimes,
+                    currentEvidence: currentEvidence,
+                    priorRecords: priorRecords,
+                    invalidSerialKeys: invalidSerialKeys
+                )
+                : currentEvidence
             var additions: [(runtimeIndex: Int, source: String, metadataIndex: Int)] = []
 
             for source in sourceGroups.keys.sorted() {
@@ -1566,7 +1584,13 @@ enum DisplayReconciler {
                 }
             }
 
-            guard !additions.isEmpty else { break }
+            if additions.isEmpty {
+                if !includePriorIdentityEvidence && !priorRecords.isEmpty {
+                    includePriorIdentityEvidence = true
+                    continue
+                }
+                break
+            }
             for addition in additions.sorted(by: {
                 if $0.source != $1.source { return $0.source < $1.source }
                 if $0.runtimeIndex != $1.runtimeIndex {
@@ -1627,6 +1651,51 @@ enum DisplayReconciler {
             return RuntimeMetadataEvidence(
                 serialKey: serials.count == 1 ? serials.first : nil,
                 aliases: aliases
+            )
+        }
+    }
+
+    /// Adds durable serial evidence only when the current runtime-to-registry
+    /// assignment is forced in every optimal one-to-one matching. The matcher
+    /// includes strong current serials, current/assigned UUID aliases, and model
+    /// elimination, so no registry record can seed more than one runtime.
+    private static func incorporatingPriorIdentityEvidence(
+        runtimes: [DisplayRuntimeObservation],
+        currentEvidence: [RuntimeMetadataEvidence],
+        priorRecords: [DisplayIdentityRecord],
+        invalidSerialKeys: Set<DisplayHardwareKey>
+    ) -> [RuntimeMetadataEvidence] {
+        guard !runtimes.isEmpty, !priorRecords.isEmpty else { return currentEvidence }
+
+        let possibilities = MaximumWeightMatcher.possibilities(
+            leftCount: runtimes.count,
+            rightCount: priorRecords.count,
+            edges: identityMatchEdges(
+                runtimes: runtimes,
+                effectiveSerials: currentEvidence.map(\.serialKey),
+                metadataAliases: currentEvidence.map(\.aliases),
+                priorRecords: priorRecords
+            )
+        )
+
+        return runtimes.indices.map { runtimeIndex in
+            let existing = currentEvidence[runtimeIndex]
+            guard possibilities.possibleRightsByLeft[runtimeIndex].count == 1,
+                  !possibilities.nilPossibleByLeft[runtimeIndex],
+                  let recordIndex = possibilities.possibleRightsByLeft[runtimeIndex].first,
+                  let establishedSerial = priorRecords[recordIndex].hardwareKey,
+                  !invalidSerialKeys.contains(establishedSerial) else {
+                return existing
+            }
+
+            var serials = Set(existing.serialKey.map { [$0] } ?? [])
+            serials.insert(establishedSerial)
+            return RuntimeMetadataEvidence(
+                serialKey: serials.count == 1 ? serials.first : nil,
+                // Historical aliases remain weaker than the current snapshot.
+                // They establish which registry record supplies the serial but
+                // are not copied into metadata matching as fresh UUID evidence.
+                aliases: existing.aliases
             )
         }
     }
@@ -2030,42 +2099,51 @@ enum DisplayReconciler {
             }
         }
 
-        // Exact serial matches can leave one or more runtimes and records from
-        // a complete metadata source as residual one-to-one candidates. If the
-        // remaining serial multisets differ, every assignment of those residual
-        // records contains conflicting evidence. Suppress all unmatched serials
-        // rather than trusting whichever source happens to be read first.
-        // Requiring equal, fully serial-bearing model groups ensures that missing
-        // metadata is not mistaken for a conflict.
+        // Compare every pair of complete sources, not just CoreGraphics
+        // runtime observations against one metadata source. Two metadata APIs
+        // can each contain a complete same-model inventory even when the runtime
+        // API reports no serials. After removing uniquely shared serials, unequal
+        // residual multisets mean that every possible one-to-one assignment
+        // contains conflicting serial evidence. Suppress every residual key
+        // rather than trusting the source visited first.
+        //
+        // A metadata source is complete for this check only when it contains the
+        // same nonzero number of model records as the runtime inventory and every
+        // record in the group has a scoped serial. This avoids interpreting a
+        // partial profiler response as a conflict.
         let invalidBeforeResidualElimination = invalid
         var residualConflicts = Set<DisplayHardwareKey>()
         let metadataBySource = Dictionary(grouping: metadata, by: \.source)
-        for source in metadataBySource.keys.sorted() {
-            let sourceRecords = metadataBySource[source, default: []]
-            let scopes = Set(runtimes.map {
-                DisplayModelScope(vendorID: $0.vendorID, productID: $0.productID)
-            }).union(sourceRecords.map {
-                DisplayModelScope(vendorID: $0.vendorID, productID: $0.productID)
-            })
+        let scopes = Set(runtimes.map {
+            DisplayModelScope(vendorID: $0.vendorID, productID: $0.productID)
+        }).union(metadata.map {
+            DisplayModelScope(vendorID: $0.vendorID, productID: $0.productID)
+        })
 
-            for scope in scopes.sorted()
-            where scope.vendorID != 0 || scope.productID != 0 {
-                let runtimeGroup = runtimes.filter {
+        for scope in scopes.sorted()
+        where scope.vendorID != 0 || scope.productID != 0 {
+            let runtimeGroup = runtimes.filter {
+                $0.vendorID == scope.vendorID && $0.productID == scope.productID
+            }
+            guard !runtimeGroup.isEmpty else { continue }
+
+            var completeSerialsBySource: [String: [DisplayHardwareKey]] = [:]
+            let runtimeKeys = runtimeGroup.compactMap {
+                serialKey(
+                    vendorID: $0.vendorID,
+                    productID: $0.productID,
+                    serialNumber: $0.serialNumber
+                )
+            }
+            if runtimeKeys.count == runtimeGroup.count {
+                completeSerialsBySource["runtime"] = runtimeKeys
+            }
+
+            for source in metadataBySource.keys.sorted() {
+                let metadataGroup = metadataBySource[source, default: []].filter {
                     $0.vendorID == scope.vendorID && $0.productID == scope.productID
                 }
-                let metadataGroup = sourceRecords.filter {
-                    $0.vendorID == scope.vendorID && $0.productID == scope.productID
-                }
-                guard !runtimeGroup.isEmpty,
-                      runtimeGroup.count == metadataGroup.count else { continue }
-
-                let runtimeKeys = runtimeGroup.compactMap {
-                    serialKey(
-                        vendorID: $0.vendorID,
-                        productID: $0.productID,
-                        serialNumber: $0.serialNumber
-                    )
-                }
+                guard metadataGroup.count == runtimeGroup.count else { continue }
                 let metadataKeys = metadataGroup.compactMap {
                     serialKey(
                         vendorID: $0.vendorID,
@@ -2073,31 +2151,43 @@ enum DisplayReconciler {
                         serialNumber: $0.serialNumber
                     )
                 }
-                guard runtimeKeys.count == runtimeGroup.count,
-                      metadataKeys.count == metadataGroup.count else { continue }
-
-                let runtimeCounts = Dictionary(grouping: runtimeKeys, by: { $0 }).mapValues(\.count)
-                let metadataCounts = Dictionary(grouping: metadataKeys, by: { $0 }).mapValues(\.count)
-                let uniquelyMatchedKeys = Set(runtimeCounts.keys).intersection(metadataCounts.keys).filter {
-                    runtimeCounts[$0] == 1 &&
-                        metadataCounts[$0] == 1 &&
-                        !invalidBeforeResidualElimination.contains($0)
+                if metadataKeys.count == metadataGroup.count {
+                    completeSerialsBySource["metadata:\(source)"] = metadataKeys
                 }
-                let remainingRuntime = runtimeKeys.filter { !uniquelyMatchedKeys.contains($0) }
-                let remainingMetadata = metadataKeys.filter { !uniquelyMatchedKeys.contains($0) }
-                let remainingRuntimeCounts = Dictionary(
-                    grouping: remainingRuntime,
-                    by: { $0 }
-                ).mapValues(\.count)
-                let remainingMetadataCounts = Dictionary(
-                    grouping: remainingMetadata,
-                    by: { $0 }
-                ).mapValues(\.count)
+            }
 
-                guard !remainingRuntime.isEmpty,
-                      remainingRuntimeCounts != remainingMetadataCounts else { continue }
-                residualConflicts.formUnion(remainingRuntime)
-                residualConflicts.formUnion(remainingMetadata)
+            let completeSources = completeSerialsBySource.keys.sorted()
+            for firstIndex in completeSources.indices {
+                for secondIndex in completeSources.indices where secondIndex > firstIndex {
+                    let firstKeys = completeSerialsBySource[completeSources[firstIndex], default: []]
+                    let secondKeys = completeSerialsBySource[completeSources[secondIndex], default: []]
+                    let firstCounts = Dictionary(grouping: firstKeys, by: { $0 }).mapValues(\.count)
+                    let secondCounts = Dictionary(grouping: secondKeys, by: { $0 }).mapValues(\.count)
+                    guard firstCounts != secondCounts else { continue }
+
+                    let uniquelyMatchedKeys = Set(firstCounts.keys)
+                        .intersection(secondCounts.keys)
+                        .filter {
+                            firstCounts[$0] == 1 &&
+                                secondCounts[$0] == 1 &&
+                                !invalidBeforeResidualElimination.contains($0)
+                        }
+                    let remainingFirst = firstKeys.filter { !uniquelyMatchedKeys.contains($0) }
+                    let remainingSecond = secondKeys.filter { !uniquelyMatchedKeys.contains($0) }
+                    let remainingFirstCounts = Dictionary(
+                        grouping: remainingFirst,
+                        by: { $0 }
+                    ).mapValues(\.count)
+                    let remainingSecondCounts = Dictionary(
+                        grouping: remainingSecond,
+                        by: { $0 }
+                    ).mapValues(\.count)
+
+                    guard !remainingFirst.isEmpty,
+                          remainingFirstCounts != remainingSecondCounts else { continue }
+                    residualConflicts.formUnion(remainingFirst)
+                    residualConflicts.formUnion(remainingSecond)
+                }
             }
         }
         invalid.formUnion(residualConflicts)

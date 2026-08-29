@@ -1899,6 +1899,138 @@ struct DisplayIdentityReconciliationTests {
         }) == Set(["profile-a", "profile-b"]))
     }
 
+    @Test("established identities participate in metadata fixed-point matching")
+    func priorRegistryEvidenceRestoresProfilerMetadata() {
+        let established = reconcileEveryPermutation(
+            runtimes: [
+                runtime(1, uuidA, serial: 111),
+                runtime(2, uuidB, serial: 222)
+            ],
+            metadata: [
+                metadata("iokit", "established-b", uuidB, serial: 222),
+                metadata("iokit", "established-a", uuidA, serial: 111)
+            ]
+        )
+        let aID = canonicalBySerial(111, in: established)!
+        let bID = canonicalBySerial(222, in: established)!
+
+        let recovered = reconcileEveryPermutation(
+            runtimes: [
+                runtime(30, uuidA, serial: nil),
+                runtime(40, uuidB, serial: nil)
+            ],
+            metadata: [
+                // Current UUID evidence survives but both runtime and IOKit
+                // temporarily lose their serial fields.
+                metadata("iokit", "serialless-b", uuidB, serial: nil, priority: 10),
+                metadata("iokit", "serialless-a", uuidA, serial: nil, priority: 10),
+                // Profiler has the physical serial and friendly name but no UUID.
+                // The established registry assignment must seed the fixed point.
+                metadata("profiler", "profile-b", serial: 222,
+                         name: "Recovered Monitor B", priority: 100),
+                metadata("profiler", "profile-a", serial: 111,
+                         name: "Recovered Monitor A", priority: 100)
+            ],
+            prior: established.registry,
+            validate: { candidate in
+                let a = candidate.display(runtimeID: 30)
+                let b = candidate.display(runtimeID: 40)
+                #expect(a?.resolution == .unique)
+                #expect(b?.resolution == .unique)
+                #expect(a?.identity?.canonicalID == aID)
+                #expect(b?.identity?.canonicalID == bID)
+                #expect(a?.metadataAssignments == [
+                    "iokit": "serialless-a",
+                    "profiler": "profile-a"
+                ])
+                #expect(b?.metadataAssignments == [
+                    "iokit": "serialless-b",
+                    "profiler": "profile-b"
+                ])
+                #expect(a?.friendlyName == "Recovered Monitor A")
+                #expect(b?.friendlyName == "Recovered Monitor B")
+                #expect(candidate.resolve(bID) ==
+                    .resolved(runtimeID: 40, canonicalReference: bID))
+                #expect(DisplayProfileMatcher.uniqueMatch(
+                    for: 40,
+                    references: [aID, bID],
+                    enabled: [true, true],
+                    snapshot: candidate
+                ) == 1)
+            }
+        )
+
+        #expect(recovered.registry.records.first {
+            $0.canonicalID == aID
+        }?.serialNumber == 111)
+        #expect(recovered.registry.records.first {
+            $0.canonicalID == bID
+        }?.serialNumber == 222)
+    }
+
+    @Test("complete metadata sources suppress mutually conflicting serials")
+    func metadataSourceSerialConflictsAreAmbiguous() {
+        let references = [
+            "\(uuidA)-SN111",
+            "\(uuidB)-SN222",
+            "\(uuidC)-SN333",
+            "\(uuidD)-SN444"
+        ]
+        let snapshot = reconcileEveryPermutation(
+            runtimes: [
+                runtime(10, uuidA, serial: nil),
+                runtime(20, uuidB, serial: nil)
+            ],
+            metadata: [
+                // UUID-bearing IOKit and UUID-less profiler are both complete,
+                // but their scoped serial inventories are disjoint.
+                metadata("iokit", "io-b", uuidB, serial: 222, priority: 10),
+                metadata("iokit", "io-a", uuidA, serial: 111, priority: 10),
+                metadata("profiler", "profile-d", serial: 444,
+                         name: "Untrusted D", priority: 100),
+                metadata("profiler", "profile-c", serial: 333,
+                         name: "Untrusted C", priority: 100)
+            ],
+            validate: { candidate in
+                #expect(candidate.displays.allSatisfy { $0.resolution == .ambiguous })
+                #expect(candidate.displays.allSatisfy { $0.identity == nil })
+                #expect(candidate.displays.allSatisfy { $0.friendlyName == nil })
+                #expect(candidate.registry.records.isEmpty)
+
+                let a = candidate.display(runtimeID: 10)
+                let b = candidate.display(runtimeID: 20)
+                #expect(a?.metadataAssignments == ["iokit": "io-a"])
+                #expect(b?.metadataAssignments == ["iokit": "io-b"])
+                #expect(Set(candidate.displays.compactMap {
+                    $0.metadataAssignments["iokit"]
+                }).count == 2)
+                #expect(candidate.displays.allSatisfy {
+                    $0.metadataAssignments["profiler"] == nil
+                })
+
+                for reference in references {
+                    #expect(candidate.resolve(reference) ==
+                        .ambiguous(candidateRuntimeIDs: [10, 20]))
+                }
+                #expect(DisplayProfileMatcher.uniqueMatch(
+                    for: 10,
+                    references: references,
+                    enabled: Array(repeating: true, count: references.count),
+                    snapshot: candidate
+                ) == nil)
+            }
+        )
+
+        let anchor = DisplayAnchorResolver.resolve(
+            preferredReference: references[1],
+            fallbackRuntimeID: 10,
+            snapshot: snapshot
+        )
+        #expect(anchor.usesFallback)
+        #expect(anchor.effectiveRuntimeID == 10)
+        #expect(!anchor.permitsAutomaticRelocation)
+    }
+
     @Test("multiple residual serial conflicts are suppressed")
     func multipleResidualSerialConflictsAreAmbiguous() {
         let runtimeSerialA = "\(uuidA)-SN111"
