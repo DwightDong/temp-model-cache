@@ -1015,6 +1015,16 @@ private struct DisplayReference {
     )
 }
 
+private struct DisplayModelScope: Hashable, Comparable {
+    let vendorID: UInt32
+    let productID: UInt32
+
+    static func < (lhs: DisplayModelScope, rhs: DisplayModelScope) -> Bool {
+        if lhs.vendorID != rhs.vendorID { return lhs.vendorID < rhs.vendorID }
+        return lhs.productID < rhs.productID
+    }
+}
+
 private struct MatchEdge: Hashable {
     let left: Int
     let right: Int
@@ -1847,9 +1857,22 @@ enum DisplayReconciler {
                 )
             }
         })
-        let modelSourceCounts = Dictionary(grouping: observations, by: {
-            "\($0.source)|\($0.key.vendorID)|\($0.key.productID)"
-        }).mapValues(\.count)
+        // Count complete source/model groups, including records whose serial
+        // is missing. A lone serial observation is not a sole attributable pair
+        // when that source also contains a serialless candidate.
+        var modelSourceCounts: [String: Int] = [:]
+        for runtime in runtimes {
+            modelSourceCounts[
+                "runtime|\(runtime.vendorID)|\(runtime.productID)",
+                default: 0
+            ] += 1
+        }
+        for record in metadata {
+            modelSourceCounts[
+                "metadata:\(record.source)|\(record.vendorID)|\(record.productID)",
+                default: 0
+            ] += 1
+        }
 
         for firstIndex in observations.indices {
             for secondIndex in observations.indices where secondIndex > firstIndex {
@@ -1869,6 +1892,71 @@ enum DisplayReconciler {
                 }
             }
         }
+
+        // Exact serial matches can leave one runtime and one record from a
+        // complete metadata source as the only possible one-to-one pair. If
+        // that residual pair reports different serials, discarding the metadata
+        // record and trusting the runtime serial would turn conflicting evidence
+        // into a stable identity. Suppress both serials instead. Requiring equal,
+        // fully serial-bearing model groups ensures that missing metadata is not
+        // mistaken for a conflict.
+        let invalidBeforeResidualElimination = invalid
+        var residualConflicts = Set<DisplayHardwareKey>()
+        let metadataBySource = Dictionary(grouping: metadata, by: \.source)
+        for source in metadataBySource.keys.sorted() {
+            let sourceRecords = metadataBySource[source, default: []]
+            let scopes = Set(runtimes.map {
+                DisplayModelScope(vendorID: $0.vendorID, productID: $0.productID)
+            }).union(sourceRecords.map {
+                DisplayModelScope(vendorID: $0.vendorID, productID: $0.productID)
+            })
+
+            for scope in scopes.sorted()
+            where scope.vendorID != 0 || scope.productID != 0 {
+                let runtimeGroup = runtimes.filter {
+                    $0.vendorID == scope.vendorID && $0.productID == scope.productID
+                }
+                let metadataGroup = sourceRecords.filter {
+                    $0.vendorID == scope.vendorID && $0.productID == scope.productID
+                }
+                guard !runtimeGroup.isEmpty,
+                      runtimeGroup.count == metadataGroup.count else { continue }
+
+                let runtimeKeys = runtimeGroup.compactMap {
+                    serialKey(
+                        vendorID: $0.vendorID,
+                        productID: $0.productID,
+                        serialNumber: $0.serialNumber
+                    )
+                }
+                let metadataKeys = metadataGroup.compactMap {
+                    serialKey(
+                        vendorID: $0.vendorID,
+                        productID: $0.productID,
+                        serialNumber: $0.serialNumber
+                    )
+                }
+                guard runtimeKeys.count == runtimeGroup.count,
+                      metadataKeys.count == metadataGroup.count else { continue }
+
+                let runtimeCounts = Dictionary(grouping: runtimeKeys, by: { $0 }).mapValues(\.count)
+                let metadataCounts = Dictionary(grouping: metadataKeys, by: { $0 }).mapValues(\.count)
+                let uniquelyMatchedKeys = Set(runtimeCounts.keys).intersection(metadataCounts.keys).filter {
+                    runtimeCounts[$0] == 1 &&
+                        metadataCounts[$0] == 1 &&
+                        !invalidBeforeResidualElimination.contains($0)
+                }
+                let remainingRuntime = runtimeKeys.filter { !uniquelyMatchedKeys.contains($0) }
+                let remainingMetadata = metadataKeys.filter { !uniquelyMatchedKeys.contains($0) }
+
+                guard remainingRuntime.count == 1,
+                      remainingMetadata.count == 1,
+                      remainingRuntime[0] != remainingMetadata[0] else { continue }
+                residualConflicts.insert(remainingRuntime[0])
+                residualConflicts.insert(remainingMetadata[0])
+            }
+        }
+        invalid.formUnion(residualConflicts)
         return invalid
     }
 

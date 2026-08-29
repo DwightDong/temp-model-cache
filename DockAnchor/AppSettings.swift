@@ -297,7 +297,7 @@ class AppSettings: ObservableObject {
         selectedDisplayUUID = reference
     }
 
-    func markDisplayReferenceAsNonPersistent(_ reference: String) {
+    private func markDisplayReferenceAsNonPersistent(_ reference: String) {
         guard !reference.isEmpty,
               nonPersistentDisplayReferences.insert(reference).inserted else {
             return
@@ -375,16 +375,10 @@ class AppSettings: ObservableObject {
     ) -> [String: String] {
         let references = [selectedDisplayUUID] + profiles.map(\.anchorDisplayUUID)
 
-        // Capture ambiguity for every persisted current-snapshot selector, not
-        // only the selected anchor. An inactive profile must not acquire a false
-        // identity later merely because one indistinguishable candidate left.
-        for reference in Set(references)
-        where !nonPersistentDisplayReferences.contains(reference) {
-            if case .ambiguous = snapshot.resolve(reference),
-               snapshot.explicitRuntimeID(for: reference) != nil {
-                markDisplayReferenceAsNonPersistent(reference)
-            }
-        }
+        // Ambiguity provenance is created only by `selectDisplay` at the moment
+        // the user explicitly chooses an ambiguous display. A legacy anchor or
+        // profile may be ambiguous while metadata is incomplete and must remain
+        // eligible for migration if a later snapshot uniquely reconciles it.
 
         let result = DisplayReferenceMigrator.migrate(
             references: references,

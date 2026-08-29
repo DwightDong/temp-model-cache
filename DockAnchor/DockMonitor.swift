@@ -252,15 +252,6 @@ class DockMonitor: NSObject, ObservableObject {
             excludingInferredReferences: AppSettings.shared.nonPersistentDisplayReferences
         )
 
-        // Also quarantine a legacy persisted selector the first time it is
-        // observed in an ambiguous snapshot. Once ambiguity has been observed,
-        // a later candidate disappearing is not new evidence about which
-        // physical monitor the old UUID/runtime selector represented.
-        if case .ambiguous = decision.preferredResolution,
-           reconciliationSnapshot.explicitRuntimeID(for: reference) != nil {
-            AppSettings.shared.markDisplayReferenceAsNonPersistent(reference)
-        }
-
         guard let runtimeID = decision.effectiveRuntimeID,
               let display = availableDisplays.first(where: {
                   $0.id == CGDirectDisplayID(runtimeID)
@@ -341,12 +332,6 @@ class DockMonitor: NSObject, ObservableObject {
             intent: .explicitUserSelection,
             announceChange: true
         )
-        if decision.isTemporaryExplicitSelection {
-            // Defensive production boundary: callers should mark the display
-            // before publishing the setting, but legacy UI/menu paths may call
-            // this method directly.
-            AppSettings.shared.markDisplayReferenceAsNonPersistent(uuid)
-        }
         resetStatusMessage(after: 3.0)
         return decision
     }
