@@ -359,6 +359,202 @@ struct DisplayIdentityReconciliationTests {
         #expect(!survivingAnchor.usesFallback)
     }
 
+    @Test("serialless weak identities stay distinct after an old canonical UUID is reused")
+    func weakCanonicalIDCollisionAfterAliasTransfer() {
+        // Establish a serialless model-X display at UUID A. Its canonical ID
+        // intentionally retains the first UUID even after the current alias moves.
+        let established = reconcileEveryPermutation(
+            runtimes: [runtime(1, uuidA, vendor: 100, product: 10)],
+            metadata: [
+                metadata("profiler", "model-x-at-a", uuidA,
+                         vendor: 100, product: 10, name: "Original X")
+            ]
+        )
+        let originalID = established.display(runtimeID: 1)!.identity!.canonicalID
+
+        // Model X moves to B while an unrelated model Y uniquely takes A. The
+        // original identity keeps its canonical ID but transfers its live alias.
+        let aliasesTransferred = reconcileEveryPermutation(
+            runtimes: [
+                runtime(20, uuidB, vendor: 100, product: 10),
+                runtime(30, uuidA, vendor: 200, product: 20)
+            ],
+            metadata: [
+                metadata("profiler", "model-y-at-a", uuidA,
+                         vendor: 200, product: 20, name: "Model Y"),
+                metadata("profiler", "model-x-at-b", uuidB,
+                         vendor: 100, product: 10, name: "Original X")
+            ],
+            prior: established.registry
+        )
+        #expect(aliasesTransferred.display(runtimeID: 20)?.identity?.canonicalID == originalID)
+        #expect(aliasesTransferred.registry.records.first {
+            $0.canonicalID == originalID
+        }?.uuidAliases == Set([uuidB]))
+
+        // A new model-X display now appears at A while the original remains at B.
+        // Its natural weak canonical base collides with originalID. It must get a
+        // deterministic collision discriminator rather than sharing that identity.
+        let bothModelXDisplays = reconcileEveryPermutation(
+            runtimes: [
+                runtime(300, uuidB, vendor: 100, product: 10),
+                runtime(400, uuidA, vendor: 100, product: 10)
+            ],
+            metadata: [
+                metadata("profiler", "new-x-at-a", uuidA,
+                         vendor: 100, product: 10, name: "New X"),
+                metadata("profiler", "original-x-at-b", uuidB,
+                         vendor: 100, product: 10, name: "Original X")
+            ],
+            prior: aliasesTransferred.registry,
+            validate: { candidate in
+                let original = candidate.display(runtimeID: 300)
+                let newDisplay = candidate.display(runtimeID: 400)
+                #expect(original?.resolution == .unique)
+                #expect(newDisplay?.resolution == .unique)
+                #expect(original?.identity?.canonicalID == originalID)
+                #expect(newDisplay?.identity?.canonicalID == "\(originalID)-C1")
+                #expect(original?.identity?.canonicalID != newDisplay?.identity?.canonicalID)
+                #expect(Set(candidate.displays.compactMap {
+                    $0.identity?.canonicalID
+                }).count == 2)
+                #expect(candidate.resolve(originalID) ==
+                    .resolved(runtimeID: 300, canonicalReference: originalID))
+                #expect(candidate.resolve("\(originalID)-C1") ==
+                    .resolved(runtimeID: 400, canonicalReference: "\(originalID)-C1"))
+            }
+        )
+        let newID = bothModelXDisplays.display(runtimeID: 400)!.identity!.canonicalID
+        let originalAnchor = DisplayAnchorResolver.resolve(
+            preferredReference: originalID,
+            fallbackRuntimeID: nil,
+            snapshot: bothModelXDisplays
+        )
+        #expect(originalAnchor.effectiveRuntimeID == 300)
+        #expect(!originalAnchor.usesFallback)
+        #expect(DisplayProfileMatcher.uniqueMatch(
+            for: 300,
+            references: [newID, originalID],
+            enabled: [true, true],
+            snapshot: bothModelXDisplays
+        ) == 1)
+        #expect(DisplayProfileMatcher.uniqueMatch(
+            for: 400,
+            references: [newID, originalID],
+            enabled: [true, true],
+            snapshot: bothModelXDisplays
+        ) == 0)
+
+        // The disambiguated canonical form is persistent and follows both weak
+        // identities through later runtime-ID and source-order churn.
+        let repeated = reconcileEveryPermutation(
+            runtimes: [
+                runtime(3_000, uuidB, vendor: 100, product: 10),
+                runtime(4_000, uuidA, vendor: 100, product: 10)
+            ],
+            metadata: [
+                metadata("iokit", "new-x", uuidA, vendor: 100, product: 10),
+                metadata("iokit", "original-x", uuidB, vendor: 100, product: 10)
+            ],
+            prior: bothModelXDisplays.registry
+        )
+        #expect(repeated.resolve(originalID) ==
+            .resolved(runtimeID: 3_000, canonicalReference: originalID))
+        #expect(repeated.resolve(newID) ==
+            .resolved(runtimeID: 4_000, canonicalReference: newID))
+    }
+
+    @Test("transient multiply claimed aliases preserve established history")
+    func ambiguousAliasHistorySurvivesAndRecovers() {
+        let established = reconcileEveryPermutation(
+            runtimes: [
+                runtime(1, uuidA, serial: 111),
+                runtime(2, uuidB, serial: 222)
+            ],
+            metadata: [
+                metadata("iokit", "physical-b", uuidB, serial: 222),
+                metadata("iokit", "physical-a", uuidA, serial: 111)
+            ]
+        )
+        let aID = canonicalBySerial(111, in: established)!
+        let bID = canonicalBySerial(222, in: established)!
+        let registryWithHistory = established.registry.recordingLegacyReferences([uuidA: aID])
+
+        // A transient metadata defect reports A's UUID for both physical displays.
+        // Serials still reconcile the displays, but the multiply claimed alias is
+        // ambiguous and must not be transferred or erased from established history.
+        let multiplyClaimed = reconcileEveryPermutation(
+            runtimes: [
+                runtime(10, nil, serial: 111),
+                runtime(20, nil, serial: 222)
+            ],
+            metadata: [
+                metadata("iokit", "stale-b", uuidA, serial: 222),
+                metadata("iokit", "physical-a", uuidA, serial: 111)
+            ],
+            prior: registryWithHistory,
+            validate: { candidate in
+                #expect(candidate.display(runtimeID: 10)?.identity?.canonicalID == aID)
+                #expect(candidate.display(runtimeID: 20)?.identity?.canonicalID == bID)
+                let aRecord = candidate.registry.records.first { $0.canonicalID == aID }
+                #expect(aRecord?.uuidAliases.contains(uuidA) == true)
+                #expect(aRecord?.legacyReferences.contains(uuidA) == true)
+            }
+        )
+
+        // The next snapshot has no serials and the duplicated UUID cannot identify
+        // either runtime. Ambiguity must likewise leave the old alias untouched.
+        let ambiguous = reconcileEveryPermutation(
+            runtimes: [
+                runtime(100, uuidA, serial: nil),
+                runtime(200, uuidA, serial: nil)
+            ],
+            metadata: [
+                metadata("profiler", "unknown-2", vendor: 100, product: 10),
+                metadata("profiler", "unknown-1", vendor: 100, product: 10)
+            ],
+            prior: multiplyClaimed.registry,
+            validate: { candidate in
+                #expect(candidate.displays.allSatisfy { $0.resolution == .ambiguous })
+                let aRecord = candidate.registry.records.first { $0.canonicalID == aID }
+                #expect(aRecord?.uuidAliases.contains(uuidA) == true)
+                #expect(aRecord?.legacyReferences.contains(uuidA) == true)
+            }
+        )
+
+        // Once the bad evidence clears, A can use its established UUID while its
+        // serial remains unavailable. Without the preserved history this runtime
+        // ties against B's same-model registry record and is ambiguous.
+        let recovered = reconcileEveryPermutation(
+            runtimes: [runtime(1_000, uuidA, serial: nil)],
+            metadata: [
+                metadata("iokit", "recovered-a", uuidA,
+                         vendor: 100, product: 10, serial: nil)
+            ],
+            prior: ambiguous.registry,
+            validate: { candidate in
+                #expect(candidate.resolve(aID) ==
+                    .resolved(runtimeID: 1_000, canonicalReference: aID))
+                #expect(candidate.resolve(uuidA) ==
+                    .resolved(runtimeID: 1_000, canonicalReference: aID))
+                #expect(candidate.resolve(bID) == .unavailable)
+            }
+        )
+        let anchor = DisplayAnchorResolver.resolve(
+            preferredReference: aID,
+            fallbackRuntimeID: nil,
+            snapshot: recovered
+        )
+        #expect(anchor.effectiveRuntimeID == 1_000)
+        #expect(!anchor.usesFallback)
+        #expect(DisplayProfileMatcher.uniqueMatch(
+            for: 1_000,
+            references: [bID, aID],
+            enabled: [true, true],
+            snapshot: recovered
+        ) == 1)
+    }
+
     @Test("one-to-one elimination resolves one display then becomes ambiguous")
     func oneToOneEliminationAndAmbiguityTransition() {
         let established = DisplayReconciler.reconcile(
@@ -1139,6 +1335,10 @@ struct DisplayIdentityReconciliationTests {
             "DockAnchorDisplay-UUID-not-a-uuid-V100M10",
             "DockAnchorDisplay-UUID-\(uuidB.lowercased())-V100M10",
             "DockAnchorDisplay-UUID-\(uuidB)-V0M0",
+            "DockAnchorDisplay-UUID-\(uuidB)-V100M10-C0",
+            "DockAnchorDisplay-UUID-\(uuidB)-V100M10-C01",
+            "DockAnchorDisplay-UUID-\(uuidB)-V100M10-C1-extra",
+            "DockAnchorDisplay-V100M10-SN222-C1",
             " DockAnchorDisplay-V100M10"
         ]
         let migration = DisplayReferenceMigrator.migrate(

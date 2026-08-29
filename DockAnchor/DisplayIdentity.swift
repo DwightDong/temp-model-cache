@@ -901,6 +901,7 @@ private struct DisplayReference {
     /// - `DockAnchorDisplay-V<vendor>M<product>-SN<serial>`
     /// - `DockAnchorDisplay-UUID-<uuid>-V<vendor>M<product>`
     /// - `DockAnchorDisplay-V<vendor>M<product>`
+    /// - either weak form followed by `-C<collision discriminator>`
     ///
     /// Prefix matching alone is intentionally insufficient. Unknown
     /// canonical-looking settings must remain malformed and unresolved.
@@ -917,7 +918,7 @@ private struct DisplayReference {
             guard let normalizedAlias = normalizedUUIDAlias(alias),
                   normalizedAlias == alias,
                   modelSuffix.hasPrefix("-"),
-                  let model = parseVendorModel(String(modelSuffix.dropFirst())) else {
+                  let model = parseWeakVendorModel(String(modelSuffix.dropFirst())) else {
                 return nil
             }
             return DisplayReference(
@@ -948,7 +949,7 @@ private struct DisplayReference {
             )
         }
 
-        guard let model = parseVendorModel(body) else { return nil }
+        guard let model = parseWeakVendorModel(body) else { return nil }
         return DisplayReference(
             kind: .canonical,
             uuidAlias: nil,
@@ -957,6 +958,26 @@ private struct DisplayReference {
             productID: model.product,
             runtimeID: nil
         )
+    }
+
+    private static func parseWeakVendorModel(
+        _ text: String
+    ) -> (vendor: UInt32, product: UInt32)? {
+        if let model = parseVendorModel(text) { return model }
+
+        guard let marker = text.range(of: "-C", options: .backwards),
+              marker.upperBound < text.endIndex,
+              let model = parseVendorModel(String(text[..<marker.lowerBound])) else {
+            return nil
+        }
+        let discriminatorText = text[marker.upperBound...]
+        guard discriminatorText.allSatisfy({ $0.isNumber }),
+              let discriminator = UInt64(discriminatorText),
+              discriminator != 0,
+              String(discriminator) == String(discriminatorText) else {
+            return nil
+        }
+        return model
     }
 
     private static func parseVendorModel(
@@ -1567,6 +1588,17 @@ enum DisplayReconciler {
         var canonicalByRuntime = Array<String?>(repeating: nil, count: runtimes.count)
         var replacements: [String: String] = [:]
 
+        // Canonical values are durable references even after a weak record is
+        // promoted to a serial identity. Reserve both current IDs and canonical
+        // legacy history so a newly created weak identity can never make an old
+        // saved reference refer to two records.
+        var reservedCanonicalIDs = Set(prior.records.map(\.canonicalID))
+        for record in prior.records {
+            reservedCanonicalIDs.formUnion(
+                record.legacyReferences.filter(DisplayReference.isValidCanonicalID)
+            )
+        }
+
         for index in runtimes.indices where resolution[index] == .unique {
             let runtime = runtimes[index]
             let assignedPrior = assignedPriorByRuntime[index].map { prior.records[$0] }
@@ -1600,8 +1632,18 @@ enum DisplayReconciler {
                 // Never clear an established serial merely because this
                 // snapshot temporarily lacks serial metadata.
             } else {
-                canonicalID = canonicalWeakID(runtime: runtime)
-                record = records[canonicalID] ?? DisplayIdentityRecord(
+                // A weak canonical ID contains the UUID which first established
+                // the identity, but UUID aliases can later be transferred to a
+                // different physical record. Do not reuse an occupied historical
+                // canonical ID for a newly eliminated display: doing so would
+                // make two current runtimes share one physical identity. A stable,
+                // registry-derived discriminator is used only on collision and
+                // never depends on runtime ID or discovery order.
+                canonicalID = availableWeakCanonicalID(
+                    runtime: runtime,
+                    occupiedCanonicalIDs: reservedCanonicalIDs
+                )
+                record = DisplayIdentityRecord(
                     canonicalID: canonicalID,
                     vendorID: runtime.vendorID,
                     productID: runtime.productID
@@ -1609,6 +1651,7 @@ enum DisplayReconciler {
             }
 
             records[canonicalID] = record
+            reservedCanonicalIDs.insert(canonicalID)
             canonicalByRuntime[index] = canonicalID
         }
 
@@ -1618,8 +1661,10 @@ enum DisplayReconciler {
         // be able to take its current alias from a stale owner even when its
         // serial is temporarily unavailable. Applying removals before additions
         // also makes a complete port swap independent of runtime iteration order.
-        // Ambiguous displays never claim aliases, and an alias observed on more
-        // than one current runtime is removed rather than assigned arbitrarily.
+        // Ambiguous displays never claim aliases. An alias observed on more
+        // than one current runtime is not assigned, but its established history
+        // is preserved: transient ambiguous evidence is not proof that the old
+        // physical association became false.
         let aliasClaims = metadataAliases.reduce(into: [String: Int]()) { counts, aliases in
             for alias in aliases { counts[alias, default: 0] += 1 }
         }
@@ -1631,10 +1676,11 @@ enum DisplayReconciler {
             }
         }
 
-        let multiplyClaimedAliases = Set(aliasClaims.compactMap { alias, count in
-            count > 1 ? alias : nil
-        })
-        let aliasesToRemove = multiplyClaimedAliases.union(canonicalClaimByAlias.keys)
+        // Transfer only aliases with one current runtime and one uniquely
+        // reconciled owner. In particular, do not delete aliases or bare-UUID
+        // migration history merely because a bad snapshot reports the same UUID
+        // for multiple displays.
+        let aliasesToRemove = Set(canonicalClaimByAlias.keys)
         var bareUUIDHistoryByAlias: [String: Set<String>] = [:]
         for recordID in records.keys.sorted() {
             guard var record = records[recordID] else { continue }
@@ -1874,6 +1920,20 @@ enum DisplayReconciler {
             return "DockAnchorDisplay-UUID-\(alias)-V\(runtime.vendorID)M\(runtime.productID)"
         }
         return "DockAnchorDisplay-V\(runtime.vendorID)M\(runtime.productID)"
+    }
+
+    private static func availableWeakCanonicalID(
+        runtime: DisplayRuntimeObservation,
+        occupiedCanonicalIDs: Set<String>
+    ) -> String {
+        let base = canonicalWeakID(runtime: runtime)
+        guard occupiedCanonicalIDs.contains(base) else { return base }
+
+        var discriminator: UInt64 = 1
+        while occupiedCanonicalIDs.contains("\(base)-C\(discriminator)") {
+            discriminator += 1
+        }
+        return "\(base)-C\(discriminator)"
     }
 
     private static func metadataSortKey(_ record: DisplayMetadataObservation) -> String {
