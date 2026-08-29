@@ -1612,33 +1612,54 @@ enum DisplayReconciler {
             canonicalByRuntime[index] = canonicalID
         }
 
-        // Strong serial attribution may transfer a port-derived UUID away from
-        // a stale owner. Weak evidence may add only an unowned alias. An alias
-        // observed on multiple current runtimes is itself ambiguous and is
-        // removed rather than assigned according to runtime ordering.
+        // Assign every uniquely observed current UUID in one transaction after
+        // all physical identities have been reconciled. The one-to-one snapshot
+        // result is the authority here: a display resolved by elimination must
+        // be able to take its current alias from a stale owner even when its
+        // serial is temporarily unavailable. Applying removals before additions
+        // also makes a complete port swap independent of runtime iteration order.
+        // Ambiguous displays never claim aliases, and an alias observed on more
+        // than one current runtime is removed rather than assigned arbitrarily.
         let aliasClaims = metadataAliases.reduce(into: [String: Int]()) { counts, aliases in
             for alias in aliases { counts[alias, default: 0] += 1 }
         }
-        for (alias, count) in aliasClaims where count > 1 {
-            for recordID in Array(records.keys) {
-                records[recordID]?.uuidAliases.remove(alias)
+        var canonicalClaimByAlias: [String: String] = [:]
+        for index in runtimes.indices where resolution[index] == .unique {
+            guard let canonicalID = canonicalByRuntime[index] else { continue }
+            for alias in metadataAliases[index] where aliasClaims[alias] == 1 {
+                canonicalClaimByAlias[alias] = canonicalID
             }
         }
-        for index in runtimes.indices where resolution[index] == .unique {
-            guard let canonicalID = canonicalByRuntime[index], var record = records[canonicalID] else { continue }
-            for alias in metadataAliases[index] where aliasClaims[alias] == 1 {
-                let owners = records.values.filter {
-                    $0.canonicalID != canonicalID && $0.uuidAliases.contains(alias)
-                }.map(\.canonicalID)
-                if effectiveSerials[index] != nil {
-                    for ownerID in owners {
-                        records[ownerID]?.uuidAliases.remove(alias)
-                    }
-                    record.uuidAliases.insert(alias)
-                } else if owners.isEmpty {
-                    record.uuidAliases.insert(alias)
+
+        let multiplyClaimedAliases = Set(aliasClaims.compactMap { alias, count in
+            count > 1 ? alias : nil
+        })
+        let aliasesToRemove = multiplyClaimedAliases.union(canonicalClaimByAlias.keys)
+        var bareUUIDHistoryByAlias: [String: Set<String>] = [:]
+        for recordID in records.keys.sorted() {
+            guard var record = records[recordID] else { continue }
+            record.uuidAliases.subtract(aliasesToRemove)
+
+            // Bare UUID migrations duplicate alias ownership in legacy history.
+            // Remove stale exact-match entries in the same transaction and carry
+            // them to the uniquely reconciled current owner below.
+            record.legacyReferences = Set(record.legacyReferences.filter { reference in
+                let parsed = DisplayReference.parse(reference)
+                guard parsed.kind == .bareUUID,
+                      let alias = parsed.uuidAlias.flatMap(DisplayReference.normalizedUUIDAlias),
+                      aliasesToRemove.contains(alias) else {
+                    return true
                 }
-            }
+                bareUUIDHistoryByAlias[alias, default: []].insert(reference)
+                return false
+            })
+            records[recordID] = record
+        }
+        for alias in canonicalClaimByAlias.keys.sorted() {
+            guard let canonicalID = canonicalClaimByAlias[alias],
+                  var record = records[canonicalID] else { continue }
+            record.uuidAliases.insert(alias)
+            record.legacyReferences.formUnion(bareUUIDHistoryByAlias[alias, default: []])
             records[canonicalID] = record
         }
 

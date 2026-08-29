@@ -246,6 +246,119 @@ struct DisplayIdentityReconciliationTests {
         #expect(missing.resolve(bID) == .resolved(runtimeID: 20, canonicalReference: bID))
     }
 
+    @Test("swapped aliases transfer atomically when one display loses its serial")
+    func swappedAliasOwnershipSurvivesSerialLossAndDisconnect() {
+        let established = reconcileEveryPermutation(
+            runtimes: [
+                runtime(1, uuidA, serial: 111),
+                runtime(2, uuidB, serial: 222)
+            ],
+            metadata: [
+                metadata("iokit", "hardware-b", uuidB, serial: 222),
+                metadata("iokit", "hardware-a", uuidA, serial: 111)
+            ]
+        )
+        let aID = canonicalBySerial(111, in: established)!
+        let bID = canonicalBySerial(222, in: established)!
+        let registryWithBareUUIDHistory = established.registry.recordingLegacyReferences([
+            uuidA: aID,
+            uuidB: bID
+        ])
+
+        let suiteName = "DockAnchorTests.atomic-alias-transfer.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suiteName)!
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        defaults.set(bID, forKey: "selectedDisplayUUID")
+        let settings = AppSettings(
+            userDefaults: defaults,
+            manageLoginItem: false,
+            mainDisplayReference: uuidA
+        )
+        let profileA = DockProfile(name: "Physical A", anchorDisplayUUID: aID, autoActivate: true)
+        let profileB = DockProfile(name: "Physical B", anchorDisplayUUID: bID, autoActivate: true)
+        settings.profiles = [profileA, profileB]
+        settings.activeProfileID = profileB.id
+        let originalProfiles = settings.profiles
+
+        // The UUID aliases exchange ports while B's serial is temporarily
+        // unavailable. Strong serial evidence resolves A, and one-to-one
+        // elimination resolves B. Both unique results must claim their current
+        // aliases in the same registry transaction.
+        let swapped = reconcileEveryPermutation(
+            runtimes: [
+                runtime(30, uuidB, serial: 111),
+                runtime(40, uuidA, serial: nil)
+            ],
+            metadata: [
+                metadata("iokit", "b-without-serial", uuidA, serial: nil),
+                metadata("iokit", "a-with-serial", uuidB, serial: 111)
+            ],
+            prior: registryWithBareUUIDHistory,
+            validate: { candidate in
+                #expect(candidate.resolve(aID) ==
+                    .resolved(runtimeID: 30, canonicalReference: aID))
+                #expect(candidate.resolve(bID) ==
+                    .resolved(runtimeID: 40, canonicalReference: bID))
+                #expect(candidate.resolve(uuidA) ==
+                    .resolved(runtimeID: 40, canonicalReference: bID))
+                #expect(candidate.resolve(uuidB) ==
+                    .resolved(runtimeID: 30, canonicalReference: aID))
+                let aRecord = candidate.registry.records.first { $0.canonicalID == aID }
+                let bRecord = candidate.registry.records.first { $0.canonicalID == bID }
+                #expect(aRecord?.uuidAliases == Set([uuidB]))
+                #expect(aRecord?.legacyReferences.contains(uuidA) == false)
+                #expect(bRecord?.uuidAliases == Set([uuidA]))
+                #expect(bRecord?.legacyReferences.contains(uuidA) == true)
+            }
+        )
+        #expect(settings.reconcileDisplayReferences(using: swapped).isEmpty)
+        #expect(settings.selectedDisplayUUID == bID)
+        #expect(settings.profiles == originalProfiles)
+        #expect(settings.activeProfileID == profileB.id)
+        #expect(settings.findAutoActivateProfile(
+            forRuntimeDisplayID: 40,
+            snapshot: swapped
+        )?.id == profileB.id)
+        let swappedAnchor = DisplayAnchorResolver.resolve(
+            preferredReference: settings.selectedDisplayUUID,
+            fallbackRuntimeID: 30,
+            snapshot: swapped
+        )
+        #expect(swappedAnchor.effectiveRuntimeID == 40)
+        #expect(!swappedAnchor.usesFallback)
+
+        // Disconnect A while B still has no serial. B must now resolve through
+        // the alias transferred by the prior complete snapshot, not A's stale
+        // pre-swap ownership. Repeat the final fixture with source permutations
+        // and verify both anchor and profile continuity.
+        let afterADisconnects = reconcileEveryPermutation(
+            runtimes: [runtime(400, uuidA, serial: nil)],
+            metadata: [metadata("iokit", "only-b", uuidA, serial: nil)],
+            prior: swapped.registry,
+            validate: { candidate in
+                #expect(candidate.resolve(aID) == .unavailable)
+                #expect(candidate.resolve(bID) ==
+                    .resolved(runtimeID: 400, canonicalReference: bID))
+                #expect(candidate.display(runtimeID: 400)?.identity?.canonicalID == bID)
+            }
+        )
+        #expect(settings.reconcileDisplayReferences(using: afterADisconnects).isEmpty)
+        #expect(settings.selectedDisplayUUID == bID)
+        #expect(settings.profiles == originalProfiles)
+        #expect(settings.activeProfileID == profileB.id)
+        #expect(settings.findAutoActivateProfile(
+            forRuntimeDisplayID: 400,
+            snapshot: afterADisconnects
+        )?.id == profileB.id)
+        let survivingAnchor = DisplayAnchorResolver.resolve(
+            preferredReference: settings.selectedDisplayUUID,
+            fallbackRuntimeID: 400,
+            snapshot: afterADisconnects
+        )
+        #expect(survivingAnchor.effectiveRuntimeID == 400)
+        #expect(!survivingAnchor.usesFallback)
+    }
+
     @Test("one-to-one elimination resolves one display then becomes ambiguous")
     func oneToOneEliminationAndAmbiguityTransition() {
         let established = DisplayReconciler.reconcile(
