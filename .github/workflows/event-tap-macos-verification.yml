@@ -52,6 +52,7 @@ jobs:
             -destination 'platform=macOS' \
             -configuration Debug \
             -parallel-testing-enabled NO \
+            -only-testing:DockAnchorTests \
             -resultBundlePath "$RUNNER_TEMP/DockAnchor-Debug.xcresult" \
             CODE_SIGN_IDENTITY="-" \
             CODE_SIGNING_REQUIRED=NO \
