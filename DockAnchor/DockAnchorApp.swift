@@ -121,9 +121,11 @@ class ApplicationDelegate: NSObject, NSApplicationDelegate, ObservableObject {
         // Only perform accessibility-dependent operations if permissions are granted
         let hasPermissions = dockMonitor.requestAccessibilityPermissions()
         if hasPermissions {
-            // Restore persisted identity without treating it as an explicit
-            // current-display click. Ambiguity must remain on fallback.
-            let anchorDecision = dockMonitor.restorePersistedAnchor()
+            // Initialization, launch restoration, view appearance, and
+            // monitoring startup all share one cached or in-flight inventory.
+            dockMonitor.requestLaunchInventory(
+                automaticallyRelocate: appSettings.autoRelocateDock
+            )
 
             // Auto-start monitoring if enabled (with a small delay for system stability)
             if appSettings.runInBackground {
@@ -132,12 +134,6 @@ class ApplicationDelegate: NSObject, NSApplicationDelegate, ObservableObject {
                 }
             }
 
-            // Auto-relocate dock to anchored display on launch if enabled
-            if appSettings.autoRelocateDock && anchorDecision.permitsAutomaticRelocation {
-                DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self] in
-                    self?.dockMonitor.relocateDockToAnchoredDisplay()
-                }
-            }
         }
 
         // Check for updates after a short delay

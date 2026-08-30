@@ -416,7 +416,8 @@ class AppSettings: ObservableObject {
     @discardableResult
     func switchToProfile(
         _ profile: DockProfile,
-        using snapshot: DisplayReconciliationSnapshot? = nil
+        using snapshot: DisplayReconciliationSnapshot? = nil,
+        requestsAutomaticRelocation: Bool = true
     ) -> DisplayReferenceResolution {
         let currentSnapshot = snapshot ?? DockMonitor.shared.reconciliationSnapshot
         let resolution = currentSnapshot.resolve(
@@ -432,7 +433,13 @@ class AppSettings: ObservableObject {
         }
 
         activeProfileID = profile.id
-        publishSelectedDisplay(profile.anchorDisplayUUID, context: .profile)
+        let context = requestsAutomaticRelocation
+            ? DisplayAnchorChangeContext.profile
+            : DisplayAnchorChangeContext(
+                selectionIntent: .persistedPreference,
+                requestsAutomaticRelocation: false
+            )
+        publishSelectedDisplay(profile.anchorDisplayUUID, context: context)
         return resolution
     }
 

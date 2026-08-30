@@ -13,6 +13,47 @@ import CoreGraphics
 import Combine
 import IOKit
 
+
+private final class DisplayConfigurationCallbackContext {
+    private let lock = NSLock()
+    private weak var monitor: DockMonitor?
+
+    init(monitor: DockMonitor) {
+        self.monitor = monitor
+    }
+
+    func handle(
+        displayID: CGDirectDisplayID,
+        flags: CGDisplayChangeSummaryFlags
+    ) {
+        lock.lock()
+        let monitor = monitor
+        lock.unlock()
+        monitor?.handleDisplayConfigurationChange(
+            displayID: displayID,
+            flags: flags
+        )
+    }
+
+    func invalidate() {
+        lock.lock()
+        monitor = nil
+        lock.unlock()
+    }
+}
+
+private func dockAnchorDisplayReconfigurationCallback(
+    displayID: CGDirectDisplayID,
+    flags: CGDisplayChangeSummaryFlags,
+    userInfo: UnsafeMutableRawPointer?
+) {
+    guard let userInfo else { return }
+    let context = Unmanaged<DisplayConfigurationCallbackContext>
+        .fromOpaque(userInfo)
+        .takeUnretainedValue()
+    context.handle(displayID: displayID, flags: flags)
+}
+
 class DockMonitor: NSObject, ObservableObject {
     static let shared = DockMonitor()
 
@@ -25,6 +66,11 @@ class DockMonitor: NSObject, ObservableObject {
 
     private(set) var reconciliationSnapshot = DisplayReconciliationSnapshot.empty
     private var identityRegistry = DockMonitor.loadIdentityRegistry()
+    private var inventoryProvider: DisplayInventoryPreparing!
+    private var inventoryRefreshCoordinator: DisplayInventoryRefreshCoordinator<PreparedDisplayInventory>!
+    private var committedInventoryGeneration: UInt64?
+    private var launchRelocationRequested = false
+    private var inventoryAnchorRequestsToSkip: [DisplayAnchorChangeRequest] = []
 
     private var eventTap: CFMachPort?
     private var runLoopSource: CFRunLoopSource?
@@ -33,6 +79,7 @@ class DockMonitor: NSObject, ObservableObject {
     private let dockOrientationPreferences: DockOrientationPreferenceController
     private var cancellables = Set<AnyCancellable>()
     private var permissionCheckTimer: Timer?
+    private var displayConfigurationCallbackContext: DisplayConfigurationCallbackContext?
 
     /// Gets the current anchor display ID (derived from UUID)
     private var anchorDisplayID: CGDirectDisplayID {
@@ -202,20 +249,57 @@ class DockMonitor: NSObject, ObservableObject {
         self.init(orientationProvider: SystemDockOrientationProvider())
     }
 
-    init(orientationProvider: DockOrientationProviding) {
+    init(
+        orientationProvider: DockOrientationProviding,
+        inventoryProvider suppliedInventoryProvider: DisplayInventoryPreparing? = nil,
+        inventoryScheduler: DisplayInventoryRefreshScheduling = DispatchDisplayInventoryRefreshScheduler()
+    ) {
         dockOrientationPreferences = DockOrientationPreferenceController(
             provider: orientationProvider
         )
         super.init()
-        setupInitialState()
+
+        let provider = suppliedInventoryProvider
+            ?? ReconciledDisplayInventoryProvider(
+                source: SystemDisplayInventorySource(),
+                initialRegistry: identityRegistry
+            )
+        inventoryProvider = provider
+        let orientationPreferences = dockOrientationPreferences
+        inventoryRefreshCoordinator = DisplayInventoryRefreshCoordinator(
+            scheduler: inventoryScheduler,
+            operation: { [provider, orientationPreferences] scope, cancellation in
+                guard let prepared = provider.prepare(
+                    scope: scope,
+                    cancellation: cancellation
+                ), !cancellation.isCancelled else { return nil }
+                // Keep the existing defaults-based orientation provider, but
+                // never execute it on the main queue as part of inventory
+                // publication.
+                _ = orientationPreferences.refresh()
+                return cancellation.isCancelled ? nil : prepared
+            },
+            commit: { [weak self] prepared, request, generation in
+                self?.commitInventory(
+                    prepared,
+                    request: request,
+                    generation: generation
+                )
+            }
+        )
+
         setupNotificationObservers()
+        setupInitialState()
     }
 
     private func setupInitialState() {
-        // Initialize with a runtime observation; the first complete snapshot
-        // immediately replaces this with a reconciled effective identity.
+        // Keep a cheap runtime reference only until the first complete
+        // asynchronous inventory commits. No CoreGraphics/IOKit/profiler work
+        // is performed synchronously during monitor initialization.
         anchorDisplayUUID = Self.getCurrentDisplayReference(for: CGMainDisplayID())
-        updateAvailableDisplays()
+        inventoryRefreshCoordinator.request(
+            .demand(reason: .initialization)
+        )
         setupDisplayConfigurationMonitoring()
         _ = requestAccessibilityPermissions()
     }
@@ -226,6 +310,12 @@ class DockMonitor: NSObject, ObservableObject {
             .receive(on: DispatchQueue.main)
             .sink { [weak self] request in
                 guard let self = self else { return }
+                if let index = self.inventoryAnchorRequestsToSkip.firstIndex(
+                    of: request
+                ) {
+                    self.inventoryAnchorRequestsToSkip.remove(at: index)
+                    return
+                }
                 let decision = self.applyAnchorReference(
                     request.reference,
                     intent: request.selectionIntent,
@@ -267,7 +357,7 @@ class DockMonitor: NSObject, ObservableObject {
 
     /// Gets the reconciled reference for the current main display.
     func getMainDisplayUUID() -> String {
-        availableDisplays.first { $0.id == CGMainDisplayID() }?.uuid
+        availableDisplays.first { $0.isPrimary }?.uuid
             ?? Self.getCurrentDisplayReference(for: CGMainDisplayID())
     }
 
@@ -287,7 +377,7 @@ class DockMonitor: NSObject, ObservableObject {
            let builtIn = availableDisplays.first(where: { $0.isBuiltIn }) {
             return builtIn.id
         }
-        return availableDisplays.first(where: { $0.id == CGMainDisplayID() })?.id
+        return availableDisplays.first(where: { $0.isPrimary })?.id
             ?? availableDisplays.first?.id
     }
 
@@ -298,23 +388,307 @@ class DockMonitor: NSObject, ObservableObject {
         updateAnchoredDisplayName()
     }
 
+    /// View appearance is demand, not an invalidation. A valid committed
+    /// inventory or initialization already in flight is reused.
     func updateAvailableDisplays() {
-        let newDisplays = getAllDisplays()
-        availableDisplays = newDisplays
-
-        // Orientation and this newly discovered layout are planned together.
-        // A failed/malformed preference read retains the previous valid value.
-        _ = refreshDockOrientation(
-            rebuildGeometry: false,
-            announceChange: false
+        inventoryRefreshCoordinator.request(
+            .demand(reason: .viewAppearance)
         )
-        validateCurrentAnchorDisplay()
-        updateAnchoredDisplayName()
+    }
+
+    private func requestInventoryInvalidation(
+        scope: DisplayInventoryRefreshScope,
+        reasons: DisplayInventoryRefreshReasons
+    ) {
+        inventoryRefreshCoordinator.request(
+            .invalidation(scope: scope, reasons: reasons)
+        )
+    }
+
+    /// Application launch can arrive before or after initialization finishes.
+    /// In both cases it reuses that inventory and performs at most one
+    /// generation-checked relocation after a complete snapshot exists.
+    func requestLaunchInventory(automaticallyRelocate: Bool) {
+        inventoryRefreshCoordinator.request(
+            .demand(reason: .initialization)
+        )
+        guard automaticallyRelocate else { return }
+        launchRelocationRequested = true
+        if let generation = committedInventoryGeneration,
+           inventoryRefreshCoordinator.isCurrentGeneration(generation) {
+            launchRelocationRequested = false
+            scheduleInventoryRelocation(after: 1.5, generation: generation)
+        }
+    }
+
+    var inventoryRefreshDiagnostics: DisplayInventoryRefreshDiagnostics {
+        inventoryRefreshCoordinator.diagnostics
+    }
+
+    private func commitInventory(
+        _ prepared: PreparedDisplayInventory,
+        request: DisplayInventoryRefreshRequest,
+        generation: UInt64
+    ) {
+        let priorRuntimeIDs = Set(availableDisplays.map { UInt64($0.id) })
+        var snapshot = prepared.reconciliation
+
+        // Migration, registry history, and registry persistence are performed
+        // once and only for the accepted generation.
+        let selectedReferenceBeforeMigration = AppSettings.shared.selectedDisplayUUID
+        let migrations = AppSettings.shared.reconcileDisplayReferences(
+            using: snapshot
+        )
+        if AppSettings.shared.selectedDisplayUUID != selectedReferenceBeforeMigration {
+            inventoryAnchorRequestsToSkip.append(DisplayAnchorChangeRequest(
+                reference: AppSettings.shared.selectedDisplayUUID,
+                selectionIntent: .persistedPreference,
+                requestsAutomaticRelocation: false
+            ))
+        }
+        let committedRegistry = snapshot.registry.recordingLegacyReferences(
+            migrations
+        )
+        snapshot = snapshot.withRegistry(committedRegistry)
+        let displays = makeDisplayInfos(
+            from: prepared.acquisition,
+            snapshot: snapshot
+        )
+
+        identityRegistry = committedRegistry
+        reconciliationSnapshot = snapshot
+        availableDisplays = displays
+        inventoryProvider.recordCommittedInventory(
+            prepared.acquisition,
+            registry: committedRegistry
+        )
+
+        // Orientation, anchor resolution, classifier frames, and relocation
+        // geometry all derive from this same accepted inventory before the one
+        // public display-change notification is sent.
+        _ = applyAnchorReference(
+            AppSettings.shared.selectedDisplayUUID,
+            intent: .persistedPreference,
+            announceChange: false,
+            rebuildGeometry: false
+        )
+        saveIdentityRegistry()
+        committedInventoryGeneration = generation
+
+        let currentRuntimeIDs = Set(displays.map { UInt64($0.id) })
+        handleCommittedInventorySideEffects(
+            request: request,
+            generation: generation,
+            addedRuntimeIDs: currentRuntimeIDs.subtracting(priorRuntimeIDs),
+            removedRuntimeIDs: priorRuntimeIDs.subtracting(currentRuntimeIDs)
+        )
+        // Profile activation above may change the effective anchor. Publish
+        // topology, anchor exclusion, and relocation geometry together once.
         rebuildEventClassifierConfiguration()
 
-        DispatchQueue.main.async {
-            self.objectWillChange.send()
-            NotificationCenter.default.post(name: .displaysDidChange, object: nil)
+        NotificationCenter.default.post(name: .displaysDidChange, object: nil)
+    }
+
+    private func makeDisplayInfos(
+        from acquisition: DisplayInventoryAcquisition,
+        snapshot: DisplayReconciliationSnapshot
+    ) -> [DisplayInfo] {
+        let runtimes = acquisition.runtime.observations
+        let aliasCounts = Dictionary(
+            grouping: runtimes.compactMap(\.uuidAlias),
+            by: { $0 }
+        ).mapValues(\.count)
+        let mainRuntimeID = acquisition.runtime.mainRuntimeID
+
+        var displays = snapshot.displays.map { reconciled -> DisplayInfo in
+            let runtimeID = reconciled.runtime.runtimeID
+            let displayID = CGDirectDisplayID(runtimeID)
+            let frame = acquisition.runtime.framesByRuntimeID[runtimeID] ?? .zero
+            let isPrimary = runtimeID == mainRuntimeID
+            let explicitReference: String
+            if reconciled.resolution == .unique,
+               let persistent = reconciled.persistentReference {
+                explicitReference = persistent
+            } else if let alias = reconciled.runtime.uuidAlias,
+                      aliasCounts[alias] == 1 {
+                explicitReference = alias
+            } else {
+                explicitReference = "DisplayID-\(displayID)"
+            }
+
+            let baseName = reconciled.friendlyName
+                ?? fallbackDisplayName(
+                    frame: frame,
+                    mainFrame: acquisition.runtime.framesByRuntimeID[mainRuntimeID]
+                        ?? .zero,
+                    isPrimary: isPrimary,
+                    isBuiltIn: reconciled.isBuiltIn
+                )
+            let name = isPrimary && !baseName.contains("(Primary)")
+                ? "\(baseName) (Primary)"
+                : baseName
+            return DisplayInfo(
+                id: displayID,
+                uuid: explicitReference,
+                serialNumber: reconciled.identity?.serialNumber,
+                frame: frame,
+                name: name,
+                isPrimary: isPrimary,
+                isBuiltIn: reconciled.isBuiltIn,
+                identityResolution: reconciled.resolution
+            )
+        }
+
+        displays.sort { lhs, rhs in
+            if lhs.isPrimary != rhs.isPrimary { return lhs.isPrimary }
+            if lhs.frame.minX != rhs.frame.minX {
+                return lhs.frame.minX < rhs.frame.minX
+            }
+            return lhs.frame.minY < rhs.frame.minY
+        }
+        return displays
+    }
+
+    private func handleCommittedInventorySideEffects(
+        request: DisplayInventoryRefreshRequest,
+        generation: UInt64,
+        addedRuntimeIDs: Set<UInt64>,
+        removedRuntimeIDs: Set<UInt64>
+    ) {
+        let settings = AppSettings.shared
+        var relocationDelay: TimeInterval?
+        var statusResetDelay: TimeInterval?
+
+        if request.reasons.contains(.displayAdded) && !addedRuntimeIDs.isEmpty {
+            let decisions = addedRuntimeIDs.sorted().map { runtimeID in
+                DisplayHotPlugResolver.displayAdded(
+                    runtimeID: runtimeID,
+                    preferredReference: settings.selectedDisplayUUID,
+                    profileReferences: settings.profiles.map(\.anchorDisplayUUID),
+                    profileAutoActivation: settings.profiles.map(\.autoActivate),
+                    currentAnchorIsUnique: anchorIdentityState == .unique,
+                    autoRelocate: settings.autoRelocateDock,
+                    snapshot: reconciliationSnapshot,
+                    excludingInferredReferences: settings.nonPersistentDisplayReferences
+                )
+            }
+            let profileIndices = Set(
+                decisions.compactMap(\.autoActivateProfileIndex)
+            )
+            var profileActivated = false
+            if profileIndices.count == 1,
+               let profileIndex = profileIndices.first,
+               settings.profiles.indices.contains(profileIndex) {
+                let profile = settings.profiles[profileIndex]
+                let currentAnchorMatches =
+                    settings.selectedDisplayUUID == profile.anchorDisplayUUID
+                if settings.activeProfileID != profile.id || !currentAnchorMatches {
+                    let resolution = settings.switchToProfile(
+                        profile,
+                        using: reconciliationSnapshot,
+                        requestsAutomaticRelocation: false
+                    )
+                    inventoryAnchorRequestsToSkip.append(
+                        DisplayAnchorChangeRequest(
+                            reference: profile.anchorDisplayUUID,
+                            selectionIntent: .persistedPreference,
+                            requestsAutomaticRelocation: false
+                        )
+                    )
+                    _ = applyAnchorReference(
+                        profile.anchorDisplayUUID,
+                        intent: .persistedPreference,
+                        announceChange: false,
+                        rebuildGeometry: false
+                    )
+                    publishStatus("Auto-activated profile: \(profile.name)")
+                    profileActivated = true
+                    if settings.autoRelocateDock,
+                       resolution.isUniquelyResolved {
+                        relocationDelay = 1.0
+                    }
+                }
+            }
+
+            if !profileActivated {
+                if decisions.contains(where: \.restoresPreferredAnchor) {
+                    publishStatus(
+                        "Preferred display reconnected - restoring anchor to \(anchoredDisplay)"
+                    )
+                } else if decisions.contains(where: \.isAmbiguous) {
+                    publishStatus(
+                        "Ambiguous display identity - preserving the preferred anchor"
+                    )
+                } else {
+                    publishStatus(
+                        "New display detected - reconciled display identities"
+                    )
+                }
+                if decisions.contains(where: \.permitsAutomaticRelocation) {
+                    relocationDelay = 1.0
+                }
+            }
+            statusResetDelay = 3.0
+        }
+
+        if request.reasons.contains(.displayRemoved) && !removedRuntimeIDs.isEmpty {
+            if anchorIdentityState == .ambiguous {
+                publishStatus(
+                    "Ambiguous display identity - preserving the preferred anchor"
+                )
+            } else if anchorIdentityState != .unique {
+                let defaultName = settings.defaultAnchorDisplay == .builtIn
+                    ? "Built-in" : "Primary"
+                publishStatus(
+                    "Anchor display disconnected - temporarily using \(defaultName)"
+                )
+            } else {
+                publishStatus("Display removed - reconciled display identities")
+            }
+            statusResetDelay = 3.0
+        }
+
+        if request.reasons.contains(.mainDisplayChanged) {
+            publishStatus("Main display updated")
+            if anchorIdentityState != .ambiguous,
+               settings.autoRelocateDock {
+                relocationDelay = min(relocationDelay ?? 0.5, 0.5)
+            }
+            statusResetDelay = 3.0
+        } else if request.reasons.contains(.arrangementChanged) {
+            publishStatus("Display arrangement updated")
+            statusResetDelay = max(statusResetDelay ?? 0, 2.0)
+        }
+
+        if launchRelocationRequested {
+            launchRelocationRequested = false
+            if anchorIdentityState == .unique,
+               settings.autoRelocateDock {
+                relocationDelay = min(relocationDelay ?? 1.5, 1.5)
+            }
+        }
+
+        if let relocationDelay {
+            scheduleInventoryRelocation(
+                after: relocationDelay,
+                generation: generation
+            )
+        }
+        if let statusResetDelay {
+            resetStatusMessage(after: statusResetDelay)
+        }
+    }
+
+    private func scheduleInventoryRelocation(
+        after delay: TimeInterval,
+        generation: UInt64
+    ) {
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
+            guard let self,
+                  self.inventoryRefreshCoordinator.isCurrentGeneration(
+                    generation
+                  ) else { return }
+            self.relocateDockToAnchoredDisplay()
         }
     }
 
@@ -342,7 +716,8 @@ class DockMonitor: NSObject, ObservableObject {
     private func applyAnchorReference(
         _ reference: String,
         intent: DisplayAnchorSelectionIntent,
-        announceChange: Bool
+        announceChange: Bool,
+        rebuildGeometry: Bool = true
     ) -> DisplayAnchorDecision {
         let decision = DisplayAnchorResolver.resolve(
             preferredReference: reference,
@@ -356,7 +731,10 @@ class DockMonitor: NSObject, ObservableObject {
               let display = availableDisplays.first(where: {
                   $0.id == CGDirectDisplayID(runtimeID)
               }) else {
-            useConfiguredFallback(state: identityState(for: decision.preferredResolution))
+            useConfiguredFallback(
+                state: identityState(for: decision.preferredResolution),
+                rebuildGeometry: rebuildGeometry
+            )
             return decision
         }
 
@@ -365,7 +743,8 @@ class DockMonitor: NSObject, ObservableObject {
         if decision.usesFallback {
             useConfiguredFallback(
                 state: identityState(for: decision.preferredResolution),
-                display: display
+                display: display,
+                rebuildGeometry: rebuildGeometry
             )
         } else if decision.isTemporaryExplicitSelection {
             anchorIdentityState = .ambiguous
@@ -378,7 +757,9 @@ class DockMonitor: NSObject, ObservableObject {
                 publishStatus("Anchor changed to \(anchoredDisplay)")
             }
         }
-        rebuildEventClassifierConfiguration()
+        if rebuildGeometry {
+            rebuildEventClassifierConfiguration()
+        }
         return decision
     }
 
@@ -393,7 +774,8 @@ class DockMonitor: NSObject, ObservableObject {
 
     private func useConfiguredFallback(
         state: AnchorIdentityState,
-        display: DisplayInfo? = nil
+        display: DisplayInfo? = nil,
+        rebuildGeometry: Bool = true
     ) {
         anchorIdentityState = state
         if let display = display
@@ -416,7 +798,9 @@ class DockMonitor: NSObject, ObservableObject {
         case .unique:
             break
         }
-        rebuildEventClassifierConfiguration()
+        if rebuildGeometry {
+            rebuildEventClassifierConfiguration()
+        }
     }
 
     private func updateAnchoredDisplayName() {
@@ -530,7 +914,9 @@ class DockMonitor: NSObject, ObservableObject {
 
         guard !isMonitoring else { return }
 
-        updateAvailableDisplays()
+        inventoryRefreshCoordinator.request(
+            .demand(reason: .monitoringStartup)
+        )
 
         // Include mouse moved + tap-disabled notifications so we can recover if the system disables tap
         let mouseMovedMask = 1 << CGEventType.mouseMoved.rawValue
@@ -879,241 +1265,14 @@ class DockMonitor: NSObject, ObservableObject {
         UserDefaults.standard.set(data, forKey: Self.identityRegistryDefaultsKey)
     }
 
-    /// Builds all source observations first, then reconciles them once. Every
-    /// display consumer uses the resulting snapshot rather than repeating a
-    /// local first-match lookup.
-    private func getAllDisplays() -> [DisplayInfo] {
-        let maxDisplays: UInt32 = 16
-        var displayIDs = [CGDirectDisplayID](repeating: 0, count: Int(maxDisplays))
-        var displayCount: UInt32 = 0
-        guard CGGetActiveDisplayList(maxDisplays, &displayIDs, &displayCount) == .success else {
-            return []
-        }
-
-        displayIDs = Array(displayIDs.prefix(Int(displayCount))).filter {
-            let bounds = CGDisplayBounds($0)
-            return bounds.width > 0 && bounds.height > 0
-        }
-
-        let runtimes = displayIDs.map { displayID in
-            DisplayRuntimeObservation(
-                runtimeID: UInt64(displayID),
-                uuidAlias: Self.getDisplayUUIDAlias(for: displayID),
-                vendorID: CGDisplayVendorNumber(displayID),
-                productID: CGDisplayModelNumber(displayID),
-                serialNumber: CGDisplaySerialNumber(displayID) == 0
-                    ? nil
-                    : CGDisplaySerialNumber(displayID),
-                isBuiltIn: CGDisplayIsBuiltin(displayID) != 0
-            )
-        }
-        let metadata = getIOKitDisplayMetadata() + getSystemProfilerDisplayMetadata()
-        var snapshot = DisplayReconciler.reconcile(
-            runtimes: runtimes,
-            metadata: metadata,
-            priorRegistry: identityRegistry
-        )
-
-        // Migrate every occurrence of a value together. Ambiguous/unavailable
-        // values remain byte-for-byte unchanged.
-        let migrations = AppSettings.shared.reconcileDisplayReferences(using: snapshot)
-        identityRegistry = snapshot.registry.recordingLegacyReferences(migrations)
-        snapshot = snapshot.withRegistry(identityRegistry)
-        reconciliationSnapshot = snapshot
-        saveIdentityRegistry()
-
-        let rawAliases = Dictionary(grouping: runtimes.compactMap { $0.uuidAlias }, by: { $0 })
-            .mapValues(\.count)
-        let frames = Dictionary(uniqueKeysWithValues: displayIDs.map { ($0, CGDisplayBounds($0)) })
-        let mainDisplayID = CGMainDisplayID()
-
-        var displays = snapshot.displays.map { reconciled -> DisplayInfo in
-            let displayID = CGDirectDisplayID(reconciled.runtime.runtimeID)
-            let frame = frames[displayID] ?? .zero
-            let isPrimary = displayID == mainDisplayID
-            let explicitReference: String
-            if reconciled.resolution == .unique, let persistent = reconciled.persistentReference {
-                explicitReference = persistent
-            } else if let alias = reconciled.runtime.uuidAlias,
-                      rawAliases[alias] == 1 {
-                explicitReference = alias
-            } else {
-                explicitReference = "DisplayID-\(displayID)"
-            }
-
-            let baseName = reconciled.friendlyName
-                ?? fallbackDisplayName(for: displayID, frame: frame, mainDisplayID: mainDisplayID)
-            let name = isPrimary && !baseName.contains("(Primary)")
-                ? "\(baseName) (Primary)"
-                : baseName
-            return DisplayInfo(
-                id: displayID,
-                uuid: explicitReference,
-                serialNumber: reconciled.identity?.serialNumber,
-                frame: frame,
-                name: name,
-                isPrimary: isPrimary,
-                isBuiltIn: reconciled.isBuiltIn,
-                identityResolution: reconciled.resolution
-            )
-        }
-
-        // This ordering is presentation only and never participates in identity
-        // assignment.
-        displays.sort { lhs, rhs in
-            if lhs.isPrimary != rhs.isPrimary { return lhs.isPrimary }
-            if lhs.frame.minX != rhs.frame.minX { return lhs.frame.minX < rhs.frame.minX }
-            return lhs.frame.minY < rhs.frame.minY
-        }
-        return displays
-    }
-
-    private func getIOKitDisplayMetadata() -> [DisplayMetadataObservation] {
-        var iterator: io_iterator_t = 0
-        guard IOServiceGetMatchingServices(
-            kIOMainPortDefault,
-            IOServiceMatching("IODisplayConnect"),
-            &iterator
-        ) == KERN_SUCCESS else { return [] }
-        defer { IOObjectRelease(iterator) }
-
-        var observations: [DisplayMetadataObservation] = []
-        while case let service = IOIteratorNext(iterator), service != 0 {
-            defer { IOObjectRelease(service) }
-            guard let info = IODisplayCreateInfoDictionary(
-                service,
-                IOOptionBits(kIODisplayOnlyPreferredName)
-            )?.takeRetainedValue() as? [String: Any] else { continue }
-
-            var registryID: UInt64 = 0
-            IORegistryEntryGetRegistryEntryID(service, &registryID)
-            let vendor = uint32Value(info[kDisplayVendorID]) ?? 0
-            let product = uint32Value(info[kDisplayProductID]) ?? 0
-            let serial = uint32Value(info[kDisplaySerialNumber]).flatMap { $0 == 0 ? nil : $0 }
-            let uuidAlias = stringValue(
-                info["DisplayUUID"] ?? info["IODisplayUUID"] ?? info["UUID"]
-            )
-            let name = localizedProductName(info[kDisplayProductName])
-
-            observations.append(DisplayMetadataObservation(
-                source: "iokit",
-                sourceID: "iokit-\(registryID)",
-                uuidAlias: uuidAlias,
-                vendorID: vendor,
-                productID: product,
-                serialNumber: serial,
-                name: name,
-                presentationPriority: 50
-            ))
-        }
-        return observations
-    }
-
-    private func getSystemProfilerDisplayMetadata() -> [DisplayMetadataObservation] {
-        let task = Process()
-        task.executableURL = URL(fileURLWithPath: "/usr/sbin/system_profiler")
-        task.arguments = ["-json", "SPDisplaysDataType"]
-        let pipe = Pipe()
-        task.standardOutput = pipe
-
-        do {
-            try task.run()
-            task.waitUntilExit()
-            let data = pipe.fileHandleForReading.readDataToEndOfFile()
-            guard task.terminationStatus == 0,
-                  let root = try JSONSerialization.jsonObject(with: data) as? [String: Any],
-                  let adapters = root["SPDisplaysDataType"] as? [[String: Any]] else {
-                return []
-            }
-
-            var rawRecords: [(baseID: String, observation: DisplayMetadataObservation)] = []
-            for adapter in adapters {
-                guard let displays = adapter["spdisplays_ndrvs"] as? [[String: Any]] else { continue }
-                for display in displays {
-                    let name = stringValue(display["_name"])
-                    let vendor = profilerUInt32(
-                        display["_spdisplays_display-vendor-id"] ?? display["spdisplays_vendor-id"],
-                        hexadecimalByDefault: true
-                    ) ?? 0
-                    let product = profilerUInt32(
-                        display["_spdisplays_display-product-id"] ?? display["spdisplays_product-id"],
-                        hexadecimalByDefault: true
-                    ) ?? 0
-                    let serial = profilerUInt32(
-                        display["_spdisplays_display-serial-number"]
-                            ?? display["_spdisplays_display-serial-number2"]
-                            ?? display["spdisplays_display-serial-number"],
-                        hexadecimalByDefault: false
-                    ).flatMap { $0 == 0 ? nil : $0 }
-                    let uuidAlias = stringValue(
-                        display["_spdisplays_display-uuid"] ?? display["spdisplays_display-uuid"]
-                    )
-                    let type = stringValue(display["spdisplays_display_type"])
-                        ?? stringValue(display["_spdisplays_display-type"])
-                    let isBuiltIn = type.map {
-                        $0.localizedCaseInsensitiveContains("built-in") ||
-                        $0.localizedCaseInsensitiveContains("internal")
-                    }
-                    let resolution = stringValue(display["_spdisplays_resolution"])
-                        ?? stringValue(display["spdisplays_resolution"])
-                    var identityComponents: [String] = []
-                    identityComponents.append(uuidAlias ?? "")
-                    identityComponents.append(String(vendor))
-                    identityComponents.append(String(product))
-                    identityComponents.append(String(serial ?? 0))
-                    identityComponents.append(name ?? "")
-                    identityComponents.append(type ?? "")
-                    identityComponents.append(resolution ?? "")
-                    let baseID = identityComponents.joined(separator: "|")
-                    rawRecords.append((
-                        baseID: baseID,
-                        observation: DisplayMetadataObservation(
-                            source: "system_profiler",
-                            sourceID: baseID,
-                            uuidAlias: uuidAlias,
-                            vendorID: vendor,
-                            productID: product,
-                            serialNumber: serial,
-                            name: name,
-                            isBuiltIn: isBuiltIn,
-                            presentationPriority: 100
-                        )
-                    ))
-                }
-            }
-
-            // Stable occurrence suffixes avoid depending on profiler array order.
-            var occurrences: [String: Int] = [:]
-            return rawRecords.sorted { $0.baseID < $1.baseID }.map { item in
-                let occurrence = occurrences[item.baseID, default: 0]
-                occurrences[item.baseID] = occurrence + 1
-                let record = item.observation
-                return DisplayMetadataObservation(
-                    source: record.source,
-                    sourceID: "profiler-\(item.baseID)#\(occurrence)",
-                    uuidAlias: record.uuidAlias,
-                    vendorID: record.vendorID,
-                    productID: record.productID,
-                    serialNumber: record.serialNumber,
-                    name: record.name,
-                    isBuiltIn: record.isBuiltIn,
-                    presentationPriority: record.presentationPriority
-                )
-            }
-        } catch {
-            return []
-        }
-    }
-
     private func fallbackDisplayName(
-        for displayID: CGDirectDisplayID,
         frame: CGRect,
-        mainDisplayID: CGDirectDisplayID
+        mainFrame: CGRect,
+        isPrimary: Bool,
+        isBuiltIn: Bool
     ) -> String {
-        if CGDisplayIsBuiltin(displayID) != 0 { return "Built-in Display" }
-        if displayID == mainDisplayID { return "Primary Display" }
-
-        let mainFrame = CGDisplayBounds(mainDisplayID)
+        if isBuiltIn { return "Built-in Display" }
+        if isPrimary { return "Primary Display" }
         if frame.minX >= mainFrame.maxX { return "Right Display" }
         if frame.maxX <= mainFrame.minX { return "Left Display" }
         if frame.minY >= mainFrame.maxY { return "Bottom Display" }
@@ -1121,152 +1280,30 @@ class DockMonitor: NSObject, ObservableObject {
         return "Secondary Display"
     }
 
-    private func localizedProductName(_ value: Any?) -> String? {
-        if let names = value as? [String: String] {
-            return names["en_US"]
-                ?? names["en"]
-                ?? names.keys.sorted().compactMap { names[$0] }.first
-        }
-        if let names = value as? [String: Any] {
-            return names.keys.sorted().compactMap { stringValue(names[$0]) }.first
-        }
-        return stringValue(value)
-    }
-
-    private func stringValue(_ value: Any?) -> String? {
-        if let value = value as? String, !value.isEmpty { return value }
-        if let value = value as? NSString, value.length > 0 { return value as String }
-        return nil
-    }
-
-    private func uint32Value(_ value: Any?) -> UInt32? {
-        if let value = value as? UInt32 { return value }
-        if let value = value as? UInt64, value <= UInt64(UInt32.max) { return UInt32(value) }
-        if let value = value as? Int, value >= 0, value <= Int(UInt32.max) { return UInt32(value) }
-        if let value = value as? NSNumber { return value.uint32Value }
-        if let value = stringValue(value) { return UInt32(value) }
-        return nil
-    }
-
-    private func profilerUInt32(_ value: Any?, hexadecimalByDefault: Bool) -> UInt32? {
-        if !(value is String) && !(value is NSString) { return uint32Value(value) }
-        guard var text = stringValue(value)?.trimmingCharacters(in: .whitespacesAndNewlines),
-              !text.isEmpty else { return nil }
-        text = text.lowercased()
-        if text.hasPrefix("0x") { return UInt32(text.dropFirst(2), radix: 16) }
-        if text.allSatisfy({ $0.isNumber }) {
-            return UInt32(text, radix: hexadecimalByDefault ? 16 : 10)
-        }
-        if text.allSatisfy({ $0.isHexDigit }) { return UInt32(text, radix: 16) }
-        return nil
-    }
-
     func refreshDisplays() {
-        updateAvailableDisplays()
+        requestInventoryInvalidation(
+            scope: .full,
+            reasons: .explicitRefresh
+        )
     }
 
     private func setupDisplayConfigurationMonitoring() {
-        // Register for display configuration changes
-        CGDisplayRegisterReconfigurationCallback({ (displayID, flags, userInfo) in
-            guard let userInfo = userInfo else { return }
-            let monitor = Unmanaged<DockMonitor>.fromOpaque(userInfo).takeUnretainedValue()
-            monitor.handleDisplayConfigurationChange(displayID: displayID, flags: flags)
-        }, Unmanaged.passUnretained(self).toOpaque())
+        let context = DisplayConfigurationCallbackContext(monitor: self)
+        displayConfigurationCallbackContext = context
+        CGDisplayRegisterReconfigurationCallback(
+            dockAnchorDisplayReconfigurationCallback,
+            Unmanaged.passUnretained(context).toOpaque()
+        )
     }
 
-    private func handleDisplayConfigurationChange(
+    fileprivate func handleDisplayConfigurationChange(
         displayID: CGDirectDisplayID,
         flags: CGDisplayChangeSummaryFlags
     ) {
-        DispatchQueue.main.async { [weak self] in
-            guard let self = self else { return }
-
-            if flags.contains(.addFlag) {
-                self.publishStatus("New display detected - reconciling display identities")
-                self.updateAvailableDisplays()
-
-                let connectedRuntimeID = UInt64(displayID)
-                let settings = AppSettings.shared
-                let hotPlugDecision = DisplayHotPlugResolver.displayAdded(
-                    runtimeID: connectedRuntimeID,
-                    preferredReference: settings.selectedDisplayUUID,
-                    profileReferences: settings.profiles.map(\.anchorDisplayUUID),
-                    profileAutoActivation: settings.profiles.map(\.autoActivate),
-                    currentAnchorIsUnique: self.anchorIdentityState == .unique,
-                    autoRelocate: settings.autoRelocateDock,
-                    snapshot: self.reconciliationSnapshot,
-                    excludingInferredReferences: settings.nonPersistentDisplayReferences
-                )
-                var profileActivated = false
-
-                if let profileIndex = hotPlugDecision.autoActivateProfileIndex {
-                    let profile = settings.profiles[profileIndex]
-                    let currentAnchorMatchesProfile =
-                        settings.selectedDisplayUUID == profile.anchorDisplayUUID
-                    if settings.activeProfileID != profile.id || !currentAnchorMatchesProfile {
-                        settings.switchToProfile(profile)
-                        self.publishStatus("Auto-activated profile: \(profile.name)")
-                        profileActivated = true
-                    }
-                }
-
-                if !profileActivated && hotPlugDecision.restoresPreferredAnchor {
-                    self.publishStatus("Preferred display reconnected - restoring anchor to \(self.anchoredDisplay)")
-                } else if hotPlugDecision.isAmbiguous {
-                    self.publishStatus("Ambiguous display identity - preserving the preferred anchor")
-                }
-
-                // Identity-dependent side effects all use the same snapshot
-                // decision. Ambiguous additions can neither activate a profile
-                // nor cause relocation.
-                if !profileActivated && hotPlugDecision.permitsAutomaticRelocation {
-                    DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { [weak self] in
-                        self?.relocateDockToAnchoredDisplay()
-                    }
-                }
-                self.resetStatusMessage(after: 3.0)
-
-            } else if flags.contains(.removeFlag) {
-                self.publishStatus("Display removed - reconciling display identities")
-                self.updateAvailableDisplays()
-                if self.anchorIdentityState == .ambiguous {
-                    self.publishStatus("Ambiguous display identity - preserving the preferred anchor")
-                } else if self.anchorIdentityState != .unique {
-                    let defaultName = AppSettings.shared.defaultAnchorDisplay == .builtIn
-                        ? "Built-in" : "Primary"
-                    self.publishStatus("Anchor display disconnected - temporarily using \(defaultName)")
-                }
-                self.resetStatusMessage(after: 3.0)
-
-            } else if flags.contains(.movedFlag) || flags.contains(.desktopShapeChangedFlag) {
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) { [weak self] in
-                    guard let self = self else { return }
-                    self.updateAvailableDisplays()
-                    self.publishStatus("Display arrangement updated")
-                    self.objectWillChange.send()
-                    self.resetStatusMessage(after: 2.0)
-                }
-
-            } else if flags.contains(.setMainFlag) {
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) { [weak self] in
-                    guard let self = self else { return }
-                    self.updateAvailableDisplays()
-                    self.publishStatus("Main display updated")
-                    if self.anchorIdentityState != .ambiguous,
-                       AppSettings.shared.autoRelocateDock {
-                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
-                            self?.relocateDockToAnchoredDisplay()
-                        }
-                    }
-                    self.resetStatusMessage(after: 3.0)
-                }
-
-            } else if flags.contains(.enabledFlag) ||
-                        flags.contains(.disabledFlag) ||
-                        flags.contains(.setModeFlag) {
-                self.updateAvailableDisplays()
-            }
-        }
+        guard let request = DisplayReconfigurationRefreshMapper.request(
+            for: flags
+        ) else { return }
+        inventoryRefreshCoordinator.request(request)
     }
 
     private func resetStatusMessage(after delay: TimeInterval) {
@@ -1288,6 +1325,10 @@ class DockMonitor: NSObject, ObservableObject {
     }
 
     deinit {
+        // Provider cancellation is observed by the profiler runner, and every
+        // queued commit is generation-checked before touching this monitor.
+        inventoryRefreshCoordinator?.cancel()
+
         // Ensure we're on the main thread for cleanup
         if Thread.isMainThread {
             stopMonitoring()
@@ -1297,12 +1338,16 @@ class DockMonitor: NSObject, ObservableObject {
             }
         }
 
-        // Remove display configuration callback
-        CGDisplayRemoveReconfigurationCallback({ (displayID, flags, userInfo) in
-            guard let userInfo = userInfo else { return }
-            let monitor = Unmanaged<DockMonitor>.fromOpaque(userInfo).takeUnretainedValue()
-            monitor.handleDisplayConfigurationChange(displayID: displayID, flags: flags)
-        }, Unmanaged.passUnretained(self).toOpaque())
+        // Make an in-flight callback retain no monitor before unregistering
+        // the exact callback/context pair.
+        if let context = displayConfigurationCallbackContext {
+            context.invalidate()
+            CGDisplayRemoveReconfigurationCallback(
+                dockAnchorDisplayReconfigurationCallback,
+                Unmanaged.passUnretained(context).toOpaque()
+            )
+            displayConfigurationCallbackContext = nil
+        }
 
         cancellables.removeAll()
         NotificationCenter.default.removeObserver(self)
