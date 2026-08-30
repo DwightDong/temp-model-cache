@@ -1,0 +1,132 @@
+name: DockAnchor inventory refresh macOS verification
+
+on:
+  push:
+    branches: ['verification/inventory-a327e66']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    name: Shared, Release performance, and Thread Sanitizer
+    runs-on: macos-15
+    timeout-minutes: 45
+    steps:
+      - name: Checkout exact candidate
+        uses: actions/checkout@v4
+        with:
+          ref: candidate/dockanchor-a327e66
+
+      - name: Verify exact candidate revision and environment
+        run: |
+          set -euxo pipefail
+          test "$(git rev-parse HEAD)" = "a327e667adc1aea668b4fa8d23f35a6a13dbc83d"
+          test -z "$(git status --porcelain)"
+          sw_vers
+          uname -a
+          if [ -d /Applications/Xcode_16.4.app ]; then
+            sudo xcode-select -s /Applications/Xcode_16.4.app/Contents/Developer
+          elif [ -d /Applications/Xcode_16.app ]; then
+            sudo xcode-select -s /Applications/Xcode_16.app/Contents/Developer
+          fi
+          xcode-select -p
+          xcodebuild -version
+          xcodebuild -list -project DockAnchor.xcodeproj
+
+      - name: Run complete shared scheme
+        id: shared
+        continue-on-error: true
+        run: |
+          set -o pipefail
+          xcodebuild test \
+            -project DockAnchor.xcodeproj \
+            -scheme DockAnchor \
+            -destination 'platform=macOS' \
+            -configuration Debug \
+            -parallel-testing-enabled NO \
+            -resultBundlePath "$RUNNER_TEMP/DockAnchor-Shared.xcresult" \
+            CODE_SIGN_IDENTITY="-" \
+            CODE_SIGNING_REQUIRED=NO \
+            2>&1 | tee "$RUNNER_TEMP/DockAnchor-Shared.log"
+
+      - name: Run Release performance tests
+        id: performance
+        continue-on-error: true
+        run: |
+          set -o pipefail
+          xcodebuild test \
+            -project DockAnchor.xcodeproj \
+            -scheme DockAnchor-Release-Performance \
+            -destination 'platform=macOS' \
+            -configuration Release \
+            -parallel-testing-enabled NO \
+            -only-testing:DockAnchorTests/EventTapPipelineXCTests/testReleaseClassificationLatencyAndMemory \
+            -only-testing:DockAnchorTests/DisplayInventoryRefreshXCTests/testReleaseRefreshSubmissionLatencyAndMemory \
+            -resultBundlePath "$RUNNER_TEMP/DockAnchor-Release-Performance.xcresult" \
+            CODE_SIGN_IDENTITY="-" \
+            CODE_SIGNING_REQUIRED=NO \
+            2>&1 | tee "$RUNNER_TEMP/DockAnchor-Release-Performance.log"
+
+      - name: Run Thread Sanitizer stress tests
+        id: tsan
+        continue-on-error: true
+        run: |
+          set -o pipefail
+          xcodebuild test \
+            -project DockAnchor.xcodeproj \
+            -scheme DockAnchor-ThreadSanitizer \
+            -destination 'platform=macOS' \
+            -configuration Debug \
+            -parallel-testing-enabled NO \
+            -only-testing:DockAnchorTests/DockEdgePlanningConcurrencyTests/testConcurrentOrientationAndLayoutUpdatesAreCoherent \
+            -only-testing:DockAnchorTests/EventTapPipelineXCTests/testClassifierSnapshotThreadSanitizerStress \
+            -only-testing:DockAnchorTests/DisplayInventoryRefreshXCTests/testRefreshCoordinatorThreadSanitizerStress \
+            -resultBundlePath "$RUNNER_TEMP/DockAnchor-ThreadSanitizer.xcresult" \
+            CODE_SIGN_IDENTITY="-" \
+            CODE_SIGNING_REQUIRED=NO \
+            2>&1 | tee "$RUNNER_TEMP/DockAnchor-ThreadSanitizer.log"
+
+      - name: Capture complete summaries
+        if: always()
+        run: |
+          set +e
+          : > "$RUNNER_TEMP/verification-summary.txt"
+          for name in DockAnchor-Shared DockAnchor-Release-Performance DockAnchor-ThreadSanitizer; do
+            echo "=== $name xcodebuild summary ===" | tee -a "$RUNNER_TEMP/verification-summary.txt"
+            grep -E 'Test Suite|Test Case|Executed |Testing (started|failed|cancelled|succeeded)|\*\* TEST|ThreadSanitizer|WARNING: ThreadSanitizer|measured \[' \
+              "$RUNNER_TEMP/$name.log" 2>/dev/null | tee -a "$RUNNER_TEMP/verification-summary.txt" || true
+            if [ -d "$RUNNER_TEMP/$name.xcresult" ]; then
+              xcrun xcresulttool get test-results summary \
+                --path "$RUNNER_TEMP/$name.xcresult" \
+                > "$RUNNER_TEMP/$name-summary.json" 2>> "$RUNNER_TEMP/verification-summary.txt" || \
+              xcrun xcresulttool get --legacy --format json \
+                --path "$RUNNER_TEMP/$name.xcresult" \
+                > "$RUNNER_TEMP/$name-xcresult.json"
+              cat "$RUNNER_TEMP/$name-summary.json" 2>/dev/null | tee -a "$RUNNER_TEMP/verification-summary.txt" || true
+            fi
+          done
+
+      - name: Upload verification evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: DockAnchor-inventory-refresh-macOS-verification
+          if-no-files-found: error
+          retention-days: 7
+          path: |
+            ${{ runner.temp }}/verification-summary.txt
+            ${{ runner.temp }}/DockAnchor-*.log
+            ${{ runner.temp }}/DockAnchor-*.xcresult
+            ${{ runner.temp }}/DockAnchor-*-summary.json
+            ${{ runner.temp }}/DockAnchor-*-xcresult.json
+
+      - name: Require every verification mode to pass
+        if: always()
+        run: |
+          test '${{ steps.shared.outcome }}' = success
+          test '${{ steps.performance.outcome }}' = success
+          test '${{ steps.tsan.outcome }}' = success
+          ! grep -E 'WARNING: ThreadSanitizer|ThreadSanitizer: data race' \
+            "$RUNNER_TEMP/DockAnchor-ThreadSanitizer.log"
