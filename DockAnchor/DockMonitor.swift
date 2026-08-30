@@ -18,7 +18,7 @@ class DockMonitor: NSObject, ObservableObject {
 
     @Published var isActive = false
     @Published var anchoredDisplay: String = "Primary"
-    @Published var statusMessage = "Dock Anchor Ready"
+    @Published private(set) var statusMessage = "Dock Anchor Ready"
     @Published var availableDisplays: [DisplayInfo] = []
     @Published var needsPermissionReset = false
     @Published private(set) var anchorIdentityState: AnchorIdentityState = .unavailable
@@ -39,12 +39,24 @@ class DockMonitor: NSObject, ObservableObject {
         return availableDisplays.first { $0.uuid == anchorDisplayUUID }?.id ?? CGMainDisplayID()
     }
 
-    /// Flag to suppress user mouse input during dock relocation
-    private var isRelocating = false
-
     /// Magic value to identify our synthetic events (so we don't block our own events)
     private let syntheticEventMarker: Int64 = 0xD0C4A5C4 // "DOCKASCR" in hex-ish
-    
+
+    private lazy var eventClassifier = EventTapClassifierStore(
+        syntheticEventMarker: syntheticEventMarker
+    )
+    private lazy var statusMessages = StatusMessageCoordinator(
+        initialMessage: statusMessage
+    ) { [weak self] message in
+        self?.statusMessage = message
+    }
+    private lazy var blockedEventFeedback = BlockedEventFeedbackController(
+        scheduler: DispatchEventFeedbackScheduler(queue: .main),
+        statusMessages: statusMessages
+    ) { [weak self] in
+        self?.defaultStatusMessage ?? "Dock Anchor Ready"
+    }
+
     enum AnchorIdentityState: String {
         case unique
         case unavailable
@@ -55,7 +67,7 @@ class DockMonitor: NSObject, ObservableObject {
     enum DockPosition {
         case bottom, left, right
     }
-    
+
     struct DisplayInfo: Identifiable, Hashable {
         let id: CGDirectDisplayID
         /// A persistent reconciled identity when unique, otherwise the current
@@ -84,6 +96,39 @@ class DockMonitor: NSObject, ObservableObject {
             lhs.name == rhs.name &&
             lhs.identityResolution == rhs.identityResolution
         }
+    }
+
+    private var defaultStatusMessage: String {
+        isActive
+            ? "Dock Anchor Active - Monitoring mouse movement"
+            : "Dock Anchor Ready"
+    }
+
+    /// All delayed status work is revision-checked through this coordinator.
+    /// Most callers already execute on the main run loop; the fallback keeps
+    /// @Published updates main-thread confined if a system callback does not.
+    @discardableResult
+    private func publishStatus(_ message: String) -> StatusMessageRevision {
+        if Thread.isMainThread {
+            return statusMessages.publish(message)
+        }
+        return DispatchQueue.main.sync {
+            statusMessages.publish(message)
+        }
+    }
+
+    private func rebuildEventClassifierConfiguration() {
+        let zones = availableDisplays.map { display in
+            EventTapTriggerZone(
+                displayID: UInt64(display.id),
+                displayName: display.name,
+                bounds: getDockTriggerZone(for: display)
+            )
+        }
+        eventClassifier.updateConfiguration(
+            triggerZones: zones,
+            anchorDisplayID: UInt64(anchorDisplayID)
+        )
     }
 
     /// Resolves persisted identity only. Explicit selection of a current
@@ -133,7 +178,7 @@ class DockMonitor: NSObject, ObservableObject {
         setupInitialState()
         setupNotificationObservers()
     }
-    
+
     private func setupInitialState() {
         // Initialize with a runtime observation; the first complete snapshot
         // immediately replaces this with a reconciled effective identity.
@@ -143,7 +188,7 @@ class DockMonitor: NSObject, ObservableObject {
         setupDisplayConfigurationMonitoring()
         _ = requestAccessibilityPermissions()
     }
-    
+
     private func setupNotificationObservers() {
         NotificationCenter.default.publisher(for: .anchorDisplayChanged)
             .compactMap { $0.object as? DisplayAnchorChangeRequest }
@@ -229,6 +274,7 @@ class DockMonitor: NSObject, ObservableObject {
         detectCurrentDockPosition()
         validateCurrentAnchorDisplay()
         updateAnchoredDisplayName()
+        rebuildEventClassifierConfiguration()
 
         DispatchQueue.main.async {
             self.objectWillChange.send()
@@ -288,14 +334,15 @@ class DockMonitor: NSObject, ObservableObject {
         } else if decision.isTemporaryExplicitSelection {
             anchorIdentityState = .ambiguous
             if announceChange {
-                statusMessage = "Anchor changed to \(anchoredDisplay) (physical identity ambiguous)"
+                publishStatus("Anchor changed to \(anchoredDisplay) (physical identity ambiguous)")
             }
         } else {
             anchorIdentityState = .unique
             if announceChange {
-                statusMessage = "Anchor changed to \(anchoredDisplay)"
+                publishStatus("Anchor changed to \(anchoredDisplay)")
             }
         }
+        rebuildEventClassifierConfiguration()
         return decision
     }
 
@@ -325,14 +372,15 @@ class DockMonitor: NSObject, ObservableObject {
         let defaultName = AppSettings.shared.defaultAnchorDisplay == .builtIn ? "Built-in" : "Primary"
         switch state {
         case .ambiguous:
-            statusMessage = "Ambiguous display identity - temporarily using \(defaultName)"
+            publishStatus("Ambiguous display identity - temporarily using \(defaultName)")
         case .unavailable:
-            statusMessage = "Anchor display unavailable - temporarily using \(defaultName)"
+            publishStatus("Anchor display unavailable - temporarily using \(defaultName)")
         case .unresolved:
-            statusMessage = "Anchor display reference unresolved - temporarily using \(defaultName)"
+            publishStatus("Anchor display reference unresolved - temporarily using \(defaultName)")
         case .unique:
             break
         }
+        rebuildEventClassifierConfiguration()
     }
 
     private func updateAnchoredDisplayName() {
@@ -364,14 +412,14 @@ class DockMonitor: NSObject, ObservableObject {
         // The app primarily handles bottom dock position as left/right have predictable behavior
         dockPosition = .bottom
     }
-    
+
     func requestAccessibilityPermissions() -> Bool {
         // Check if already trusted (without prompting)
         let trusted = AXIsProcessTrusted()
 
         if !trusted {
             DispatchQueue.main.async { [weak self] in
-                self?.statusMessage = "Accessibility permissions required"
+                self?.publishStatus("Accessibility permissions required")
             }
         } else {
             DispatchQueue.main.async { [weak self] in
@@ -424,7 +472,7 @@ class DockMonitor: NSObject, ObservableObject {
         // Check if accessibility permissions are still granted
         if !checkAccessibilityPermissions() {
             DispatchQueue.main.async { [weak self] in
-                self?.statusMessage = "Accessibility permissions revoked - stopping monitoring"
+                self?.publishStatus("Accessibility permissions revoked - stopping monitoring")
                 self?.stopMonitoring()
             }
             return
@@ -433,7 +481,7 @@ class DockMonitor: NSObject, ObservableObject {
         // Check if the event tap is still valid
         if let tap = eventTap, !CFMachPortIsValid(tap) {
             DispatchQueue.main.async { [weak self] in
-                self?.statusMessage = "Event tap invalidated - stopping monitoring"
+                self?.publishStatus("Event tap invalidated - stopping monitoring")
                 self?.stopMonitoring()
             }
             return
@@ -442,14 +490,14 @@ class DockMonitor: NSObject, ObservableObject {
 
     func startMonitoring() {
         guard requestAccessibilityPermissions() else {
-            statusMessage = "Please grant accessibility permissions in System Preferences"
+            publishStatus("Please grant accessibility permissions in System Preferences")
             return
         }
-        
+
         guard !isMonitoring else { return }
-        
+
         updateAvailableDisplays()
-        
+
         // Include mouse moved + tap-disabled notifications so we can recover if the system disables tap
         let mouseMovedMask = 1 << CGEventType.mouseMoved.rawValue
         let disabledByTimeoutMask = 1 << CGEventType.tapDisabledByTimeout.rawValue
@@ -468,7 +516,7 @@ class DockMonitor: NSObject, ObservableObject {
                     if let tap = monitor.eventTap {
                         CGEvent.tapEnable(tap: tap, enable: true)
                         DispatchQueue.main.async {
-                            monitor.statusMessage = "Recovered event tap after system disable"
+                            monitor.publishStatus("Recovered event tap after system disable")
                         }
                     }
                     // Pass the event through so the system continues to receive it
@@ -479,25 +527,25 @@ class DockMonitor: NSObject, ObservableObject {
             },
             userInfo: Unmanaged.passUnretained(self).toOpaque()
         )
-        
+
         guard let eventTap = eventTap else {
             // Event tap creation failed even though permissions appeared granted.
             // This usually means the permission entry is stale (app was updated).
             // The user needs to remove and re-add the app in Accessibility settings.
             needsPermissionReset = true
-            statusMessage = "Permission needs reset - remove and re-add app in Accessibility settings"
+            publishStatus("Permission needs reset - remove and re-add app in Accessibility settings")
             return
         }
-        
+
         runLoopSource = CFMachPortCreateRunLoopSource(kCFAllocatorDefault, eventTap, 0)
         CFRunLoopAddSource(CFRunLoopGetCurrent(), runLoopSource, .commonModes)
         CGEvent.tapEnable(tap: eventTap, enable: true)
-        
+
         isMonitoring = true
         startPermissionMonitoring()
         DispatchQueue.main.async { [weak self] in
             self?.isActive = true
-            self?.statusMessage = "Dock Anchor Active - Monitoring mouse movement"
+            self?.publishStatus("Dock Anchor Active - Monitoring mouse movement")
         }
     }
 
@@ -506,6 +554,7 @@ class DockMonitor: NSObject, ObservableObject {
         guard isMonitoring else { return }
 
         isMonitoring = false
+        blockedEventFeedback.cancelPendingFeedback()
 
         // Safely disable and clean up event tap
         if let eventTap = eventTap {
@@ -521,7 +570,7 @@ class DockMonitor: NSObject, ObservableObject {
 
         DispatchQueue.main.async { [weak self] in
             self?.isActive = false
-            self?.statusMessage = "Dock Anchor Stopped"
+            self?.publishStatus("Dock Anchor Stopped")
         }
     }
 
@@ -575,11 +624,11 @@ class DockMonitor: NSObject, ObservableObject {
     /// Moves the dock to the anchored display by simulating mouse movement to the dock trigger zone
     func relocateDockToAnchoredDisplay() {
         guard anchorIdentityState != .ambiguous else {
-            statusMessage = "Cannot relocate dock - display identity is ambiguous"
+            publishStatus("Cannot relocate dock - display identity is ambiguous")
             return
         }
         guard let anchorDisplay = availableDisplays.first(where: { $0.id == anchorDisplayID }) else {
-            statusMessage = "Cannot relocate dock - anchor display not found"
+            publishStatus("Cannot relocate dock - anchor display not found")
             return
         }
 
@@ -591,21 +640,15 @@ class DockMonitor: NSObject, ObservableObject {
         // Check if dock is already on the anchored display
         if let currentDockDisplay = getCurrentDockDisplayID(), currentDockDisplay == anchorDisplayID {
             DispatchQueue.main.async { [weak self] in
-                self?.statusMessage = "Dock is already on \(anchorDisplay.name)"
-                DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) { [weak self] in
-                    guard let self = self else { return }
-                    if self.isActive {
-                        self.statusMessage = "Dock Anchor Active - Monitoring mouse movement"
-                    } else {
-                        self.statusMessage = "Dock Anchor Ready"
-                    }
-                }
+                guard let self = self else { return }
+                self.publishStatus("Dock is already on \(anchorDisplay.name)")
+                self.resetStatusMessage(after: 2.0)
             }
             return
         }
 
         DispatchQueue.main.async { [weak self] in
-            self?.statusMessage = "Relocating dock to \(anchorDisplay.name)..."
+            self?.publishStatus("Relocating dock to \(anchorDisplay.name)...")
         }
 
         // Perform relocation on background thread to not block UI
@@ -624,7 +667,7 @@ class DockMonitor: NSObject, ObservableObject {
 
             // Set relocating flag - this causes the event tap to discard all mouse events
             // This is the key to preventing user mouse movement from interfering
-            self.isRelocating = true
+            self.eventClassifier.setRelocating(true)
 
             // Hide cursor during the operation for better UX
             DispatchQueue.main.sync {
@@ -674,7 +717,7 @@ class DockMonitor: NSObject, ObservableObject {
             CGWarpMouseCursorPosition(originalPosition)
 
             // Clear relocating flag - resume normal event handling
-            self.isRelocating = false
+            self.eventClassifier.setRelocating(false)
 
             // Clean up temporary event tap if we created one
             if temporaryTapCreated {
@@ -687,17 +730,9 @@ class DockMonitor: NSObject, ObservableObject {
             }
 
             DispatchQueue.main.async { [weak self] in
-                self?.statusMessage = "Dock relocated to \(anchorDisplay.name)"
-
-                // Reset status after delay
-                DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) { [weak self] in
-                    guard let self = self else { return }
-                    if self.isActive {
-                        self.statusMessage = "Dock Anchor Active - Monitoring mouse movement"
-                    } else {
-                        self.statusMessage = "Dock Anchor Ready"
-                    }
-                }
+                guard let self = self else { return }
+                self.publishStatus("Dock relocated to \(anchorDisplay.name)")
+                self.resetStatusMessage(after: 2.0)
             }
         }
     }
@@ -784,59 +819,32 @@ class DockMonitor: NSObject, ObservableObject {
             return CGPoint(x: frame.maxX - 1, y: frame.midY)
         }
     }
-    
-    private func handleMouseEvent(proxy: CGEventTapProxy, type: CGEventType, event: CGEvent) -> Unmanaged<CGEvent>? {
-        guard type == .mouseMoved else {
+
+    private func handleMouseEvent(
+        proxy: CGEventTapProxy,
+        type: CGEventType,
+        event: CGEvent
+    ) -> Unmanaged<CGEvent>? {
+        let result = eventClassifier.classify(
+            inputType: type == .mouseMoved ? .mouseMoved : .other,
+            location: event.location,
+            eventSourceUserData: event.getIntegerValueField(.eventSourceUserData)
+        )
+
+        switch result.decision {
+        case .passThrough:
             return Unmanaged.passUnretained(event)
-        }
-
-        // During dock relocation, suppress mouse events from real hardware
-        // But allow our own synthetic events to pass through
-        if isRelocating {
-            // Check if this is one of our synthetic events by looking for our marker
-            let userData = event.getIntegerValueField(.eventSourceUserData)
-            if userData == syntheticEventMarker {
-                // This is our synthetic event - let it through
-                return Unmanaged.passUnretained(event)
-            }
-            // This is a real hardware event - discard it
+        case .suppressPhysicalDuringRelocation:
+            return nil
+        case let .suppressBlockedMovement(zone):
+            blockedEventFeedback.recordBlocked(
+                displayID: zone.displayID,
+                displayName: zone.displayName
+            )
             return nil
         }
-
-        let location = event.location
-
-        // Check if mouse is approaching dock trigger zone on non-anchor displays
-        if shouldBlockDockMovement(at: location) {
-            // Block the event by not passing it through
-            return nil
-        }
-
-        return Unmanaged.passUnretained(event)
     }
-    
-    private func shouldBlockDockMovement(at location: CGPoint) -> Bool {
-        // Check if mouse is in dock trigger zone of non-anchor displays
-        for display in availableDisplays {
-            if display.id == anchorDisplayID { continue }
-            
-            let triggerZone = getDockTriggerZone(for: display)
-            if triggerZone.contains(location) {
-                DispatchQueue.main.async { [weak self] in
-                    self?.statusMessage = "Blocked dock movement attempt to \(display.name)"
-                    
-                    // Reset status message after 2 seconds
-                    DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) { [weak self] in
-                        guard let self = self else { return }
-                        self.statusMessage = "Dock Anchor Active - Monitoring mouse movement"
-                    }
-                }
-                return true
-            }
-        }
-        
-        return false
-    }
-    
+
     private func getDockTriggerZone(for display: DisplayInfo) -> CGRect {
         switch dockPosition {
         case .bottom:
@@ -862,7 +870,7 @@ class DockMonitor: NSObject, ObservableObject {
             )
         }
     }
-    
+
     private static let identityRegistryDefaultsKey = "displayIdentityRegistryV2"
 
     private static func getDisplayUUIDAlias(for displayID: CGDirectDisplayID) -> String? {
@@ -1177,7 +1185,7 @@ class DockMonitor: NSObject, ObservableObject {
         // Get the current dock position and determine which display it's on
         let dockPosition = getCurrentDockPosition()
         let currentDisplayID = getDisplayForDockPosition(dockPosition)
-        
+
         // Find the display name for the current anchor
         if let display = availableDisplays.first(where: { $0.id == currentDisplayID }) {
             DispatchQueue.main.async {
@@ -1185,24 +1193,24 @@ class DockMonitor: NSObject, ObservableObject {
             }
         }
     }
-    
+
     private func getCurrentDockPosition() -> DockPosition {
         // Get the current dock position from system preferences
         let task = Process()
         task.launchPath = "/usr/bin/defaults"
         task.arguments = ["read", "com.apple.dock", "orientation"]
-        
+
         let pipe = Pipe()
         task.standardOutput = pipe
-        
+
         do {
             try task.run()
             task.waitUntilExit()
-            
+
             let data = pipe.fileHandleForReading.readDataToEndOfFile()
             let output = String(data: data, encoding: .utf8) ?? ""
             let orientation = output.trimmingCharacters(in: .whitespacesAndNewlines)
-            
+
             switch orientation {
             case "left":
                 return .left
@@ -1215,7 +1223,7 @@ class DockMonitor: NSObject, ObservableObject {
             return .bottom
         }
     }
-    
+
     private func getDisplayForDockPosition(_ position: DockPosition) -> CGDirectDisplayID {
         // For bottom dock, find which display the dock is currently on
         if position == .bottom {
@@ -1226,7 +1234,7 @@ class DockMonitor: NSObject, ObservableObject {
                 return mouseLocation.x >= frame.minX && mouseLocation.x <= frame.maxX &&
                        mouseLocation.y >= frame.minY && mouseLocation.y <= frame.maxY
             }
-            
+
             if let screen = screen,
                let screenNumber = screen.deviceDescription[
                    NSDeviceDescriptionKey("NSScreenNumber")
@@ -1234,11 +1242,11 @@ class DockMonitor: NSObject, ObservableObject {
                 return CGDirectDisplayID(screenNumber)
             }
         }
-        
+
         // Fallback to main display
         return CGMainDisplayID()
     }
-    
+
     private func setupDisplayConfigurationMonitoring() {
         // Register for display configuration changes
         CGDisplayRegisterReconfigurationCallback({ (displayID, flags, userInfo) in
@@ -1247,7 +1255,7 @@ class DockMonitor: NSObject, ObservableObject {
             monitor.handleDisplayConfigurationChange(displayID: displayID, flags: flags)
         }, Unmanaged.passUnretained(self).toOpaque())
     }
-    
+
     private func handleDisplayConfigurationChange(
         displayID: CGDirectDisplayID,
         flags: CGDisplayChangeSummaryFlags
@@ -1256,7 +1264,7 @@ class DockMonitor: NSObject, ObservableObject {
             guard let self = self else { return }
 
             if flags.contains(.addFlag) {
-                self.statusMessage = "New display detected - reconciling display identities"
+                self.publishStatus("New display detected - reconciling display identities")
                 self.updateAvailableDisplays()
 
                 let connectedRuntimeID = UInt64(displayID)
@@ -1279,15 +1287,15 @@ class DockMonitor: NSObject, ObservableObject {
                         settings.selectedDisplayUUID == profile.anchorDisplayUUID
                     if settings.activeProfileID != profile.id || !currentAnchorMatchesProfile {
                         settings.switchToProfile(profile)
-                        self.statusMessage = "Auto-activated profile: \(profile.name)"
+                        self.publishStatus("Auto-activated profile: \(profile.name)")
                         profileActivated = true
                     }
                 }
 
                 if !profileActivated && hotPlugDecision.restoresPreferredAnchor {
-                    self.statusMessage = "Preferred display reconnected - restoring anchor to \(self.anchoredDisplay)"
+                    self.publishStatus("Preferred display reconnected - restoring anchor to \(self.anchoredDisplay)")
                 } else if hotPlugDecision.isAmbiguous {
-                    self.statusMessage = "Ambiguous display identity - preserving the preferred anchor"
+                    self.publishStatus("Ambiguous display identity - preserving the preferred anchor")
                 }
 
                 // Identity-dependent side effects all use the same snapshot
@@ -1301,14 +1309,14 @@ class DockMonitor: NSObject, ObservableObject {
                 self.resetStatusMessage(after: 3.0)
 
             } else if flags.contains(.removeFlag) {
-                self.statusMessage = "Display removed - reconciling display identities"
+                self.publishStatus("Display removed - reconciling display identities")
                 self.updateAvailableDisplays()
                 if self.anchorIdentityState == .ambiguous {
-                    self.statusMessage = "Ambiguous display identity - preserving the preferred anchor"
+                    self.publishStatus("Ambiguous display identity - preserving the preferred anchor")
                 } else if self.anchorIdentityState != .unique {
                     let defaultName = AppSettings.shared.defaultAnchorDisplay == .builtIn
                         ? "Built-in" : "Primary"
-                    self.statusMessage = "Anchor display disconnected - temporarily using \(defaultName)"
+                    self.publishStatus("Anchor display disconnected - temporarily using \(defaultName)")
                 }
                 self.resetStatusMessage(after: 3.0)
 
@@ -1316,7 +1324,7 @@ class DockMonitor: NSObject, ObservableObject {
                 DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) { [weak self] in
                     guard let self = self else { return }
                     self.updateAvailableDisplays()
-                    self.statusMessage = "Display arrangement updated"
+                    self.publishStatus("Display arrangement updated")
                     self.objectWillChange.send()
                     self.resetStatusMessage(after: 2.0)
                 }
@@ -1325,7 +1333,7 @@ class DockMonitor: NSObject, ObservableObject {
                 DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) { [weak self] in
                     guard let self = self else { return }
                     self.updateAvailableDisplays()
-                    self.statusMessage = "Main display updated"
+                    self.publishStatus("Main display updated")
                     if self.anchorIdentityState != .ambiguous,
                        AppSettings.shared.autoRelocateDock {
                         DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
@@ -1344,11 +1352,20 @@ class DockMonitor: NSObject, ObservableObject {
     }
 
     private func resetStatusMessage(after delay: TimeInterval) {
+        guard Thread.isMainThread else {
+            DispatchQueue.main.async { [weak self] in
+                self?.resetStatusMessage(after: delay)
+            }
+            return
+        }
+
+        let expectedRevision = statusMessages.currentRevision
         DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
             guard let self = self else { return }
-            self.statusMessage = self.isActive
-                ? "Dock Anchor Active - Monitoring mouse movement"
-                : "Dock Anchor Ready"
+            _ = self.statusMessages.publish(
+                self.defaultStatusMessage,
+                ifCurrent: expectedRevision
+            )
         }
     }
 
@@ -1361,15 +1378,15 @@ class DockMonitor: NSObject, ObservableObject {
                 self?.stopMonitoring()
             }
         }
-        
+
         // Remove display configuration callback
         CGDisplayRemoveReconfigurationCallback({ (displayID, flags, userInfo) in
             guard let userInfo = userInfo else { return }
             let monitor = Unmanaged<DockMonitor>.fromOpaque(userInfo).takeUnretainedValue()
             monitor.handleDisplayConfigurationChange(displayID: displayID, flags: flags)
         }, Unmanaged.passUnretained(self).toOpaque())
-        
+
         cancellables.removeAll()
         NotificationCenter.default.removeObserver(self)
     }
-} 
+}
