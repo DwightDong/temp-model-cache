@@ -30,7 +30,7 @@ class DockMonitor: NSObject, ObservableObject {
     private var runLoopSource: CFRunLoopSource?
     private var isMonitoring = false
     private var anchorDisplayUUID: String = ""  // Hardware UUID for stable anchor tracking
-    private var dockPosition: DockPosition = .bottom
+    private let dockOrientationPreferences: DockOrientationPreferenceController
     private var cancellables = Set<AnyCancellable>()
     private var permissionCheckTimer: Timer?
 
@@ -62,10 +62,6 @@ class DockMonitor: NSObject, ObservableObject {
         case unavailable
         case ambiguous
         case unresolved
-    }
-
-    enum DockPosition {
-        case bottom, left, right
     }
 
     struct DisplayInfo: Identifiable, Hashable {
@@ -118,17 +114,46 @@ class DockMonitor: NSObject, ObservableObject {
     }
 
     private func rebuildEventClassifierConfiguration() {
-        let zones = availableDisplays.map { display in
-            EventTapTriggerZone(
-                displayID: UInt64(display.id),
-                displayName: display.name,
-                bounds: getDockTriggerZone(for: display)
-            )
-        }
-        eventClassifier.updateConfiguration(
-            triggerZones: zones,
+        let plan = DockEdgePlanner.makePlan(
+            orientation: dockOrientationPreferences.currentOrientation,
+            displays: availableDisplays.map {
+                DockEdgeDisplay(
+                    displayID: UInt64($0.id),
+                    frame: $0.frame
+                )
+            }
+        )
+        let names = Dictionary(
+            uniqueKeysWithValues: availableDisplays.map {
+                (UInt64($0.id), $0.name)
+            }
+        )
+        eventClassifier.updateDockEdgePlan(
+            plan,
+            displayNames: names,
             anchorDisplayID: UInt64(anchorDisplayID)
         )
+    }
+
+    /// Re-reads the preference without treating a missing/malformed value as
+    /// bottom. A valid transition publishes one complete topology plan while
+    /// monitoring continues to use the existing event tap.
+    @discardableResult
+    private func refreshDockOrientation(
+        rebuildGeometry: Bool = true,
+        announceChange: Bool = true
+    ) -> DockOrientationRefreshResult {
+        let result = dockOrientationPreferences.refresh()
+        if result.didChange, rebuildGeometry {
+            rebuildEventClassifierConfiguration()
+        }
+        if result.didChange, announceChange, isMonitoring {
+            publishStatus(
+                "Dock orientation updated to \(result.currentOrientation.rawValue)"
+            )
+            resetStatusMessage(after: 2.0)
+        }
+        return result
     }
 
     /// Resolves persisted identity only. Explicit selection of a current
@@ -173,7 +198,14 @@ class DockMonitor: NSObject, ObservableObject {
         return nil
     }
 
-    override init() {
+    override convenience init() {
+        self.init(orientationProvider: SystemDockOrientationProvider())
+    }
+
+    init(orientationProvider: DockOrientationProviding) {
+        dockOrientationPreferences = DockOrientationPreferenceController(
+            provider: orientationProvider
+        )
         super.init()
         setupInitialState()
         setupNotificationObservers()
@@ -184,7 +216,6 @@ class DockMonitor: NSObject, ObservableObject {
         // immediately replaces this with a reconciled effective identity.
         anchorDisplayUUID = Self.getCurrentDisplayReference(for: CGMainDisplayID())
         updateAvailableDisplays()
-        detectCurrentDockPosition()
         setupDisplayConfigurationMonitoring()
         _ = requestAccessibilityPermissions()
     }
@@ -271,7 +302,12 @@ class DockMonitor: NSObject, ObservableObject {
         let newDisplays = getAllDisplays()
         availableDisplays = newDisplays
 
-        detectCurrentDockPosition()
+        // Orientation and this newly discovered layout are planned together.
+        // A failed/malformed preference read retains the previous valid value.
+        _ = refreshDockOrientation(
+            rebuildGeometry: false,
+            announceChange: false
+        )
         validateCurrentAnchorDisplay()
         updateAnchoredDisplayName()
         rebuildEventClassifierConfiguration()
@@ -407,12 +443,6 @@ class DockMonitor: NSObject, ObservableObject {
         changeAnchorDisplay(toUUID: uuid)
     }
 
-    private func detectCurrentDockPosition() {
-        // Dock position detection - kept for internal logic if needed
-        // The app primarily handles bottom dock position as left/right have predictable behavior
-        dockPosition = .bottom
-    }
-
     func requestAccessibilityPermissions() -> Bool {
         // Check if already trusted (without prompting)
         let trusted = AXIsProcessTrusted()
@@ -468,6 +498,10 @@ class DockMonitor: NSObject, ObservableObject {
     /// Verifies that accessibility permissions are still granted and event tap is valid
     private func verifyPermissionsAndTapValidity() {
         guard isMonitoring else { return }
+
+        // Polling the Dock preference while active applies left/right/bottom
+        // transitions without rebuilding the event tap or restarting monitoring.
+        _ = refreshDockOrientation()
 
         // Check if accessibility permissions are still granted
         if !checkAccessibilityPermissions() {
@@ -631,6 +665,16 @@ class DockMonitor: NSObject, ObservableObject {
             publishStatus("Cannot relocate dock - anchor display not found")
             return
         }
+        let relocationSelection = eventClassifier.relocationSelection(
+            for: UInt64(anchorDisplay.id)
+        )
+        guard relocationSelection.result?.geometry != nil else {
+            publishStatus(
+                "Cannot relocate dock - no exposed \(relocationSelection.dockPosition.rawValue) edge on \(anchorDisplay.name)"
+            )
+            resetStatusMessage(after: 2.0)
+            return
+        }
 
         // Only relocate if we have multiple displays
         guard availableDisplays.count > 1 else {
@@ -665,9 +709,24 @@ class DockMonitor: NSObject, ObservableObject {
                 temporaryTapCreated = self.createEventTapForRelocation()
             }
 
-            // Set relocating flag - this causes the event tap to discard all mouse events
-            // This is the key to preventing user mouse movement from interfering
-            self.eventClassifier.setRelocating(true)
+            // Eligibility and relocation suppression come from one current,
+            // atomically published topology snapshot. A layout/orientation
+            // change that removed the edge cannot lead to cursor movement.
+            guard let relocation = self.eventClassifier.beginRelocation(
+                for: UInt64(anchorDisplay.id)
+            )?.geometry else {
+                if temporaryTapCreated {
+                    self.removeTemporaryEventTap()
+                }
+                DispatchQueue.main.async { [weak self] in
+                    guard let self = self else { return }
+                    self.publishStatus(
+                        "Cannot relocate dock - anchor has no eligible edge"
+                    )
+                    self.resetStatusMessage(after: 2.0)
+                }
+                return
+            }
 
             // Hide cursor during the operation for better UX
             DispatchQueue.main.sync {
@@ -676,10 +735,8 @@ class DockMonitor: NSObject, ObservableObject {
 
             // Create an event source for our synthetic events
             let eventSource = CGEventSource(stateID: .hidSystemState)
-
-            // Get points for the movement
-            let approachPoint = self.getApproachPoint(for: anchorDisplay)
-            let edgePoint = self.getDockTriggerPoint(for: anchorDisplay)
+            let approachPoint = relocation.approachPoint
+            let edgePoint = relocation.targetPoint
 
             // Warp to approach point first
             CGWarpMouseCursorPosition(approachPoint)
@@ -773,53 +830,6 @@ class DockMonitor: NSObject, ObservableObject {
         return nil
     }
 
-    /// Gets the approach point (slightly before the edge) for dock trigger animation
-    private func getApproachPoint(for display: DisplayInfo) -> CGPoint {
-        let frame = display.frame
-        let offset: CGFloat = 50 // Start 50 pixels from the edge
-
-        switch dockPosition {
-        case .bottom:
-            return CGPoint(x: frame.midX, y: frame.maxY - offset)
-        case .left:
-            return CGPoint(x: frame.minX + offset, y: frame.midY)
-        case .right:
-            return CGPoint(x: frame.maxX - offset, y: frame.midY)
-        }
-    }
-
-    /// Gets a point past the edge to create "pressure" against the screen edge
-    private func getPastEdgePoint(for display: DisplayInfo) -> CGPoint {
-        let frame = display.frame
-        let overshoot: CGFloat = 20 // Try to move 20 pixels past the edge
-
-        switch dockPosition {
-        case .bottom:
-            return CGPoint(x: frame.midX, y: frame.maxY + overshoot)
-        case .left:
-            return CGPoint(x: frame.minX - overshoot, y: frame.midY)
-        case .right:
-            return CGPoint(x: frame.maxX + overshoot, y: frame.midY)
-        }
-    }
-
-    /// Gets the point in the dock trigger zone for a display
-    private func getDockTriggerPoint(for display: DisplayInfo) -> CGPoint {
-        let frame = display.frame
-
-        switch dockPosition {
-        case .bottom:
-            // Bottom center of the display, at the very edge
-            return CGPoint(x: frame.midX, y: frame.maxY - 1)
-        case .left:
-            // Left center of the display, at the very edge
-            return CGPoint(x: frame.minX + 1, y: frame.midY)
-        case .right:
-            // Right center of the display, at the very edge
-            return CGPoint(x: frame.maxX - 1, y: frame.midY)
-        }
-    }
-
     private func handleMouseEvent(
         proxy: CGEventTapProxy,
         type: CGEventType,
@@ -842,32 +852,6 @@ class DockMonitor: NSObject, ObservableObject {
                 displayName: zone.displayName
             )
             return nil
-        }
-    }
-
-    private func getDockTriggerZone(for display: DisplayInfo) -> CGRect {
-        switch dockPosition {
-        case .bottom:
-            return CGRect(
-                x: display.frame.minX,
-                y: display.frame.maxY - 10,
-                width: display.frame.width,
-                height: 10
-            )
-        case .left:
-            return CGRect(
-                x: display.frame.minX,
-                y: display.frame.minY,
-                width: 10,
-                height: display.frame.height
-            )
-        case .right:
-            return CGRect(
-                x: display.frame.maxX - 10,
-                y: display.frame.minY,
-                width: 10,
-                height: display.frame.height
-            )
         }
     }
 
@@ -1179,72 +1163,6 @@ class DockMonitor: NSObject, ObservableObject {
 
     func refreshDisplays() {
         updateAvailableDisplays()
-    }
-
-    private func updateCurrentAnchorDisplay() {
-        // Get the current dock position and determine which display it's on
-        let dockPosition = getCurrentDockPosition()
-        let currentDisplayID = getDisplayForDockPosition(dockPosition)
-
-        // Find the display name for the current anchor
-        if let display = availableDisplays.first(where: { $0.id == currentDisplayID }) {
-            DispatchQueue.main.async {
-                self.anchoredDisplay = display.name
-            }
-        }
-    }
-
-    private func getCurrentDockPosition() -> DockPosition {
-        // Get the current dock position from system preferences
-        let task = Process()
-        task.launchPath = "/usr/bin/defaults"
-        task.arguments = ["read", "com.apple.dock", "orientation"]
-
-        let pipe = Pipe()
-        task.standardOutput = pipe
-
-        do {
-            try task.run()
-            task.waitUntilExit()
-
-            let data = pipe.fileHandleForReading.readDataToEndOfFile()
-            let output = String(data: data, encoding: .utf8) ?? ""
-            let orientation = output.trimmingCharacters(in: .whitespacesAndNewlines)
-
-            switch orientation {
-            case "left":
-                return .left
-            case "right":
-                return .right
-            default:
-                return .bottom
-            }
-        } catch {
-            return .bottom
-        }
-    }
-
-    private func getDisplayForDockPosition(_ position: DockPosition) -> CGDirectDisplayID {
-        // For bottom dock, find which display the dock is currently on
-        if position == .bottom {
-            // Get the current mouse position to determine which display the dock is on
-            let mouseLocation = NSEvent.mouseLocation
-            let screen = NSScreen.screens.first { screen in
-                let frame = screen.frame
-                return mouseLocation.x >= frame.minX && mouseLocation.x <= frame.maxX &&
-                       mouseLocation.y >= frame.minY && mouseLocation.y <= frame.maxY
-            }
-
-            if let screen = screen,
-               let screenNumber = screen.deviceDescription[
-                   NSDeviceDescriptionKey("NSScreenNumber")
-               ] as? UInt32 {
-                return CGDirectDisplayID(screenNumber)
-            }
-        }
-
-        // Fallback to main display
-        return CGMainDisplayID()
     }
 
     private func setupDisplayConfigurationMonitoring() {

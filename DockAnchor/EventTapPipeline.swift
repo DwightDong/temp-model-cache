@@ -32,12 +32,16 @@ struct EventTapClassifierSnapshot {
     let applicableTriggerZones: [EventTapTriggerZone]
     let isRelocating: Bool
     let syntheticEventMarker: Int64
+    let dockPosition: DockPosition
+    let relocationResults: [UInt64: DockEdgeRelocationResult]
 
     init(
         triggerZones: [EventTapTriggerZone],
         anchorDisplayID: UInt64?,
         isRelocating: Bool,
-        syntheticEventMarker: Int64
+        syntheticEventMarker: Int64,
+        dockPosition: DockPosition = .bottom,
+        relocationResults: [UInt64: DockEdgeRelocationResult] = [:]
     ) {
         if let anchorDisplayID {
             applicableTriggerZones = triggerZones.filter {
@@ -48,23 +52,31 @@ struct EventTapClassifierSnapshot {
         }
         self.isRelocating = isRelocating
         self.syntheticEventMarker = syntheticEventMarker
+        self.dockPosition = dockPosition
+        self.relocationResults = relocationResults
     }
 
     private init(
         applicableTriggerZones: [EventTapTriggerZone],
         isRelocating: Bool,
-        syntheticEventMarker: Int64
+        syntheticEventMarker: Int64,
+        dockPosition: DockPosition,
+        relocationResults: [UInt64: DockEdgeRelocationResult]
     ) {
         self.applicableTriggerZones = applicableTriggerZones
         self.isRelocating = isRelocating
         self.syntheticEventMarker = syntheticEventMarker
+        self.dockPosition = dockPosition
+        self.relocationResults = relocationResults
     }
 
     func replacingRelocationState(_ isRelocating: Bool) -> EventTapClassifierSnapshot {
         EventTapClassifierSnapshot(
             applicableTriggerZones: applicableTriggerZones,
             isRelocating: isRelocating,
-            syntheticEventMarker: syntheticEventMarker
+            syntheticEventMarker: syntheticEventMarker,
+            dockPosition: dockPosition,
+            relocationResults: relocationResults
         )
     }
 
@@ -115,9 +127,21 @@ struct EventTapClassifierSnapshot {
     }
 }
 
-/// Serializes complete classifier snapshots. Event callbacks copy one immutable
-/// value while holding the lock, then classify without holding it. Configuration
-/// and relocation updates cannot expose partially updated display/anchor state.
+struct EventTapGeometrySnapshot: Equatable {
+    let dockPosition: DockPosition
+    let applicableTriggerZones: [EventTapTriggerZone]
+    let relocationResults: [UInt64: DockEdgeRelocationResult]
+}
+
+struct DockEdgeRelocationSelection: Equatable {
+    let dockPosition: DockPosition
+    let result: DockEdgeRelocationResult?
+}
+
+/// Serializes complete classifier and relocation snapshots. Event callbacks
+/// copy one immutable value while holding the lock, then classify without
+/// holding it. An orientation/layout update replaces zones and relocation
+/// geometry together, so neither path can observe a partially published plan.
 final class EventTapClassifierStore: @unchecked Sendable {
     private let lock = NSLock()
     private var snapshot: EventTapClassifierSnapshot
@@ -133,22 +157,99 @@ final class EventTapClassifierStore: @unchecked Sendable {
 
     func updateConfiguration(
         triggerZones: [EventTapTriggerZone],
-        anchorDisplayID: UInt64?
+        anchorDisplayID: UInt64?,
+        dockPosition: DockPosition = .bottom,
+        relocationResults: [UInt64: DockEdgeRelocationResult] = [:]
     ) {
         lock.lock()
         snapshot = EventTapClassifierSnapshot(
             triggerZones: triggerZones,
             anchorDisplayID: anchorDisplayID,
             isRelocating: snapshot.isRelocating,
-            syntheticEventMarker: snapshot.syntheticEventMarker
+            syntheticEventMarker: snapshot.syntheticEventMarker,
+            dockPosition: dockPosition,
+            relocationResults: relocationResults
         )
         lock.unlock()
+    }
+
+    /// Converts one planner result into the complete production snapshot. The
+    /// conversion happens before the one locked publication, while trigger and
+    /// relocation values both originate from the same immutable plan.
+    func updateDockEdgePlan(
+        _ plan: DockEdgePlan,
+        displayNames: [UInt64: String],
+        anchorDisplayID: UInt64?
+    ) {
+        let zones = plan.displays.flatMap { displayPlan in
+            displayPlan.triggerZones.map { bounds in
+                EventTapTriggerZone(
+                    displayID: displayPlan.displayID,
+                    displayName: displayNames[displayPlan.displayID]
+                        ?? "Display \(displayPlan.displayID)",
+                    bounds: bounds
+                )
+            }
+        }
+        let relocationResults = Dictionary(
+            uniqueKeysWithValues: plan.displays.map {
+                ($0.displayID, $0.relocation)
+            }
+        )
+        updateConfiguration(
+            triggerZones: zones,
+            anchorDisplayID: anchorDisplayID,
+            dockPosition: plan.orientation,
+            relocationResults: relocationResults
+        )
     }
 
     func setRelocating(_ isRelocating: Bool) {
         lock.lock()
         snapshot = snapshot.replacingRelocationState(isRelocating)
         lock.unlock()
+    }
+
+    func relocationResult(for displayID: UInt64) -> DockEdgeRelocationResult? {
+        relocationSelection(for: displayID).result
+    }
+
+    func relocationSelection(
+        for displayID: UInt64
+    ) -> DockEdgeRelocationSelection {
+        lock.lock()
+        let selection = DockEdgeRelocationSelection(
+            dockPosition: snapshot.dockPosition,
+            result: snapshot.relocationResults[displayID]
+        )
+        lock.unlock()
+        return selection
+    }
+
+    /// Atomically verifies eligibility and enables relocation suppression from
+    /// the same geometry snapshot. No cursor movement starts for an ineligible
+    /// edge, even if layout/orientation updates race with a relocation request.
+    func beginRelocation(
+        for displayID: UInt64
+    ) -> DockEdgeRelocationResult? {
+        lock.lock()
+        let result = snapshot.relocationResults[displayID]
+        if result?.geometry != nil {
+            snapshot = snapshot.replacingRelocationState(true)
+        }
+        lock.unlock()
+        return result
+    }
+
+    func currentGeometrySnapshot() -> EventTapGeometrySnapshot {
+        lock.lock()
+        let current = EventTapGeometrySnapshot(
+            dockPosition: snapshot.dockPosition,
+            applicableTriggerZones: snapshot.applicableTriggerZones,
+            relocationResults: snapshot.relocationResults
+        )
+        lock.unlock()
+        return current
     }
 
     @inline(__always)
