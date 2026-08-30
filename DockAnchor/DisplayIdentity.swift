@@ -2028,14 +2028,23 @@ enum DisplayReconciler {
             let counts = Dictionary(grouping: keys, by: { $0 }).mapValues(\.count)
             invalid.formUnion(counts.filter { $0.value > 1 }.map(\.key))
         }
+        let duplicateSerialKeys = invalid
 
-        // If two source records can be attributed uniquely by an alias, or are
-        // the sole records for a model in both sources, disagreement is
-        // conflicting evidence rather than two identities.
+        // If two source records can be attributed uniquely to one physical
+        // candidate, disagreement is conflicting evidence rather than two
+        // identities. UUID aliases are weaker than scoped serials, however: two
+        // sources may expose crossed/stale aliases after a port swap while their
+        // unique serial inventories still support one global assignment. Preserve
+        // the serials in that case so the later one-to-one matcher follows
+        // hardware, not ports.
         struct SerialObservation {
             let source: String
             let alias: String?
             let key: DisplayHardwareKey
+        }
+        struct SourceModelScope: Hashable {
+            let source: String
+            let model: DisplayModelScope
         }
         var observations: [SerialObservation] = runtimes.compactMap { runtime in
             serialKey(
@@ -2065,21 +2074,55 @@ enum DisplayReconciler {
         })
         // Count complete source/model groups, including records whose serial
         // is missing. A lone serial observation is not a sole attributable pair
-        // when that source also contains a serialless candidate.
-        var modelSourceCounts: [String: Int] = [:]
+        // when that source also contains a serialless candidate. The connected
+        // runtime count is part of the attribution as well: one record from each
+        // of two partial metadata sources can describe different members of a
+        // two-display model group and is not evidence of a conflict.
+        var modelSourceCounts: [SourceModelScope: Int] = [:]
+        var runtimeCountsByModel: [DisplayModelScope: Int] = [:]
         for runtime in runtimes {
+            let model = DisplayModelScope(
+                vendorID: runtime.vendorID,
+                productID: runtime.productID
+            )
             modelSourceCounts[
-                "runtime|\(runtime.vendorID)|\(runtime.productID)",
+                SourceModelScope(source: "runtime", model: model),
                 default: 0
             ] += 1
+            runtimeCountsByModel[model, default: 0] += 1
         }
         for record in metadata {
+            let model = DisplayModelScope(
+                vendorID: record.vendorID,
+                productID: record.productID
+            )
             modelSourceCounts[
-                "metadata:\(record.source)|\(record.vendorID)|\(record.productID)",
+                SourceModelScope(source: "metadata:\(record.source)", model: model),
                 default: 0
             ] += 1
         }
 
+        // Retain source-level scoped serial inventories independently of aliases.
+        // An exact, unique cross-source serial assignment proves that a crossed
+        // alias is stale: either observation can be assigned to its serial peer
+        // in the other source instead of to the record sharing its port alias.
+        // Requiring only one direction also handles a partial source which omits
+        // the other display. Duplicate keys were already marked invalid above and
+        // cannot receive this protection. Compute all pairwise decisions from
+        // this immutable baseline; one unrelated conflict must not make the
+        // result depend on observation traversal or cascade through a valid
+        // serial inventory.
+        var serialCountsBySourceModel: [SourceModelScope: [DisplayHardwareKey: Int]] = [:]
+        for observation in observations {
+            let model = DisplayModelScope(
+                vendorID: observation.key.vendorID,
+                productID: observation.key.productID
+            )
+            let sourceModel = SourceModelScope(source: observation.source, model: model)
+            serialCountsBySourceModel[sourceModel, default: [:]][observation.key, default: 0] += 1
+        }
+
+        var attributableConflicts = Set<DisplayHardwareKey>()
         for firstIndex in observations.indices {
             for secondIndex in observations.indices where secondIndex > firstIndex {
                 let first = observations[firstIndex]
@@ -2088,16 +2131,34 @@ enum DisplayReconciler {
                       first.key.vendorID == second.key.vendorID,
                       first.key.productID == second.key.productID,
                       first.key.serialNumber != second.key.serialNumber else { continue }
+
+                let model = DisplayModelScope(
+                    vendorID: first.key.vendorID,
+                    productID: first.key.productID
+                )
+                let firstSourceModel = SourceModelScope(source: first.source, model: model)
+                let secondSourceModel = SourceModelScope(source: second.source, model: model)
+                let hasUniqueCrossSourceSerialAssignment =
+                    !duplicateSerialKeys.contains(first.key) &&
+                    !duplicateSerialKeys.contains(second.key) &&
+                    (
+                        serialCountsBySourceModel[firstSourceModel]?[second.key] == 1 ||
+                        serialCountsBySourceModel[secondSourceModel]?[first.key] == 1
+                    )
+
                 let sharedAlias = first.alias != nil && first.alias == second.alias
+                let aliasEstablishesConflict = sharedAlias && !hasUniqueCrossSourceSerialAssignment
                 let soleModelPair =
-                    modelSourceCounts["\(first.source)|\(first.key.vendorID)|\(first.key.productID)"] == 1 &&
-                    modelSourceCounts["\(second.source)|\(second.key.vendorID)|\(second.key.productID)"] == 1
-                if sharedAlias || soleModelPair {
-                    invalid.insert(first.key)
-                    invalid.insert(second.key)
+                    runtimeCountsByModel[model] == 1 &&
+                    modelSourceCounts[firstSourceModel] == 1 &&
+                    modelSourceCounts[secondSourceModel] == 1
+                if aliasEstablishesConflict || soleModelPair {
+                    attributableConflicts.insert(first.key)
+                    attributableConflicts.insert(second.key)
                 }
             }
         }
+        invalid.formUnion(attributableConflicts)
 
         // Compare every pair of complete sources, not just CoreGraphics
         // runtime observations against one metadata source. Two metadata APIs

@@ -2078,6 +2078,136 @@ struct DisplayIdentityReconciliationTests {
         #expect(!decision.permitsAutomaticRelocation)
     }
 
+    @Test("globally consistent serial inventories outrank crossed UUID aliases")
+    func consistentSerialInventoriesOutrankCrossedAliases() {
+        let established = reconcileEveryPermutation(
+            runtimes: [
+                runtime(1, uuidA, serial: 111),
+                runtime(2, uuidB, serial: 222)
+            ],
+            metadata: [
+                metadata("iokit", "established-b", uuidB, serial: 222),
+                metadata("iokit", "established-a", uuidA, serial: 111)
+            ]
+        )
+        let aID = canonicalBySerial(111, in: established)!
+        let bID = canonicalBySerial(222, in: established)!
+        let legacyB = "\(uuidB)-SN222"
+
+        // The displays swap CoreGraphics UUID aliases while both metadata APIs
+        // still expose the pre-swap aliases. Every source has the same unique,
+        // scoped serial inventory. Serial matching must therefore reconcile the
+        // physical displays and presentation records despite every crossed UUID
+        // pair claiming the opposite port.
+        let swapped = reconcileEveryPermutation(
+            runtimes: [
+                runtime(30, uuidB, serial: 111),
+                runtime(40, uuidA, serial: 222)
+            ],
+            metadata: [
+                metadata("iokit", "io-b", uuidB, serial: 222, priority: 10),
+                metadata("iokit", "io-a", uuidA, serial: 111, priority: 10),
+                metadata("profiler", "profile-a", uuidA, serial: 111,
+                         name: "Physical Monitor A", priority: 100),
+                metadata("profiler", "profile-b", uuidB, serial: 222,
+                         name: "Physical Monitor B", priority: 100)
+            ],
+            prior: established.registry,
+            validate: { candidate in
+                let a = candidate.display(runtimeID: 30)
+                let b = candidate.display(runtimeID: 40)
+                #expect(a?.resolution == .unique)
+                #expect(b?.resolution == .unique)
+                #expect(a?.identity?.canonicalID == aID)
+                #expect(b?.identity?.canonicalID == bID)
+                #expect(a?.identity?.serialNumber == 111)
+                #expect(b?.identity?.serialNumber == 222)
+                #expect(a?.metadataAssignments == [
+                    "iokit": "io-a",
+                    "profiler": "profile-a"
+                ])
+                #expect(b?.metadataAssignments == [
+                    "iokit": "io-b",
+                    "profiler": "profile-b"
+                ])
+                #expect(a?.friendlyName == "Physical Monitor A")
+                #expect(b?.friendlyName == "Physical Monitor B")
+                #expect(candidate.resolve(aID) ==
+                    .resolved(runtimeID: 30, canonicalReference: aID))
+                #expect(candidate.resolve(bID) ==
+                    .resolved(runtimeID: 40, canonicalReference: bID))
+                #expect(candidate.resolve(legacyB) ==
+                    .resolved(runtimeID: 40, canonicalReference: bID))
+                #expect(DisplayProfileMatcher.uniqueMatch(
+                    for: 40,
+                    references: [aID, bID],
+                    enabled: [true, true],
+                    snapshot: candidate
+                ) == 1)
+            }
+        )
+
+        #expect(DisplayReferenceMigrator.migrate(
+            references: [legacyB],
+            using: swapped
+        ).references == [bID])
+    }
+
+    @Test("complementary partial metadata sources describe different displays")
+    func complementaryPartialMetadataIsNotAConflict() {
+        let legacyA = "\(uuidA)-SN111"
+        let legacyB = "\(uuidB)-SN222"
+        let snapshot = reconcileEveryPermutation(
+            runtimes: [
+                runtime(10, uuidA, serial: nil),
+                runtime(20, uuidB, serial: nil)
+            ],
+            metadata: [
+                // Each API returned only one member of the same-model runtime
+                // group. Their different aliases uniquely identify different
+                // candidates, so their different serials are complementary.
+                metadata("iokit", "only-a", uuidA, serial: 111,
+                         name: "Partial Monitor A", priority: 100),
+                metadata("profiler", "only-b", uuidB, serial: 222,
+                         name: "Partial Monitor B", priority: 100)
+            ],
+            validate: { candidate in
+                let a = candidate.display(runtimeID: 10)
+                let b = candidate.display(runtimeID: 20)
+                #expect(a?.resolution == .unique)
+                #expect(b?.resolution == .unique)
+                #expect(a?.identity?.serialNumber == 111)
+                #expect(b?.identity?.serialNumber == 222)
+                #expect(a?.metadataAssignments == ["iokit": "only-a"])
+                #expect(b?.metadataAssignments == ["profiler": "only-b"])
+                #expect(a?.friendlyName == "Partial Monitor A")
+                #expect(b?.friendlyName == "Partial Monitor B")
+                #expect(candidate.registry.records.count == 2)
+                #expect(candidate.resolve(legacyA) ==
+                    .resolved(
+                        runtimeID: 10,
+                        canonicalReference: a!.identity!.canonicalID
+                    ))
+                #expect(candidate.resolve(legacyB) ==
+                    .resolved(
+                        runtimeID: 20,
+                        canonicalReference: b!.identity!.canonicalID
+                    ))
+            }
+        )
+
+        let profileReferences = [
+            snapshot.display(runtimeID: 20)!.identity!.canonicalID,
+            snapshot.display(runtimeID: 10)!.identity!.canonicalID
+        ]
+        #expect(DisplayProfileMatcher.uniqueMatch(
+            for: 20,
+            references: profileReferences,
+            enabled: [true, true],
+            snapshot: snapshot
+        ) == 0)
+    }
+
     @Test("canonical identity syntax is closed and strictly validated")
     func malformedCanonicalLookingReferencesStayUnresolved() {
         let validSnapshot = DisplayReconciler.reconcile(
