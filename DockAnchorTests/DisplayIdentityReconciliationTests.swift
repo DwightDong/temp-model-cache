@@ -2208,6 +2208,141 @@ struct DisplayIdentityReconciliationTests {
         ) == 0)
     }
 
+    @Test("cross-source serial evidence reassigns metadata matched by a stale UUID")
+    func strongerTransitiveSerialEvidenceReconsidersWeakAssignments() throws {
+        let legacyA = "\(uuidA)-SN111"
+        let legacyB = "\(uuidB)-SN222"
+        let snapshot = reconcileEveryPermutation(
+            runtimes: [
+                runtime(10, uuidA, serial: nil),
+                runtime(20, uuidB, serial: nil)
+            ],
+            metadata: [
+                // The complete source uniquely teaches both scoped serials.
+                metadata("iokit", "io-b", uuidB, serial: 222, priority: 10),
+                metadata("iokit", "io-a", uuidA, serial: 111, priority: 10),
+                // This partial record describes physical B but still carries
+                // A's stale port UUID. Its serial must force reconsideration of
+                // the otherwise stronger-looking UUID match to runtime A.
+                metadata("profiler", "stale-port-b", uuidA, serial: 222,
+                         name: "Physical Monitor B", priority: 100)
+            ],
+            validate: { candidate in
+                let a = candidate.display(runtimeID: 10)
+                let b = candidate.display(runtimeID: 20)
+                let aID = a?.identity?.canonicalID
+                let bID = b?.identity?.canonicalID
+
+                #expect(a?.resolution == .unique)
+                #expect(b?.resolution == .unique)
+                #expect(a?.identity?.serialNumber == 111)
+                #expect(b?.identity?.serialNumber == 222)
+                #expect(a?.metadataAssignments == ["iokit": "io-a"])
+                #expect(b?.metadataAssignments == [
+                    "iokit": "io-b",
+                    "profiler": "stale-port-b"
+                ])
+                #expect(a?.friendlyName == nil)
+                #expect(b?.friendlyName == "Physical Monitor B")
+                #expect(aID != nil && bID != nil && aID != bID)
+                #expect(a?.identity?.uuidAliases == Set([uuidA]))
+                #expect(b?.identity?.uuidAliases == Set([uuidB]))
+
+                #expect(candidate.resolve(legacyA) ==
+                    .resolved(runtimeID: 10, canonicalReference: aID!))
+                #expect(candidate.resolve(legacyB) ==
+                    .resolved(runtimeID: 20, canonicalReference: bID!))
+                #expect(DisplayReferenceMigrator.migrate(
+                    references: [legacyB, legacyA, legacyB],
+                    using: candidate
+                ).references == [bID!, aID!, bID!])
+
+                let anchor = DisplayAnchorResolver.resolve(
+                    preferredReference: legacyB,
+                    fallbackRuntimeID: 10,
+                    snapshot: candidate
+                )
+                #expect(anchor.preferredResolution ==
+                    .resolved(runtimeID: 20, canonicalReference: bID!))
+                #expect(anchor.effectiveRuntimeID == 20)
+                #expect(!anchor.usesFallback)
+                #expect(anchor.permitsAutomaticRelocation)
+                #expect(DisplayProfileMatcher.uniqueMatch(
+                    for: 20,
+                    references: [legacyA, legacyB],
+                    enabled: [true, true],
+                    snapshot: candidate
+                ) == 1)
+            }
+        )
+
+        // Exercise the same production persistence migration and profile lookup
+        // used after display discovery. Every occurrence is upgraded together;
+        // profile metadata and active selection stay unchanged.
+        let aID = snapshot.display(runtimeID: 10)!.identity!.canonicalID
+        let bID = snapshot.display(runtimeID: 20)!.identity!.canonicalID
+        let suiteName = "DockAnchorTests.stale-metadata-reassignment.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suiteName)!
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let profileB = DockProfile(
+            id: UUID(uuidString: "22222222-ABCD-4ABC-8ABC-222222222222")!,
+            name: "Physical B",
+            anchorDisplayUUID: legacyB,
+            createdAt: Date(timeIntervalSinceReferenceDate: 222),
+            autoActivate: true
+        )
+        let profileA = DockProfile(
+            id: UUID(uuidString: "11111111-ABCD-4ABC-8ABC-111111111111")!,
+            name: "Physical A",
+            anchorDisplayUUID: legacyA,
+            createdAt: Date(timeIntervalSinceReferenceDate: 111),
+            autoActivate: true
+        )
+        defaults.set(legacyB, forKey: "selectedDisplayUUID")
+        defaults.set(try JSONEncoder().encode([profileB, profileA]), forKey: "dockProfiles")
+        defaults.set(profileB.id.uuidString, forKey: "activeProfileID")
+        let settings = AppSettings(
+            userDefaults: defaults,
+            manageLoginItem: false,
+            mainDisplayReference: uuidA
+        )
+
+        #expect(settings.reconcileDisplayReferences(using: snapshot) == [
+            legacyA: aID,
+            legacyB: bID
+        ])
+        #expect(settings.selectedDisplayUUID == bID)
+        #expect(settings.profiles.map(\.anchorDisplayUUID) == [bID, aID])
+        #expect(settings.profiles.map(\.id) == [profileB.id, profileA.id])
+        #expect(settings.profiles.map(\.name) == [profileB.name, profileA.name])
+        #expect(settings.profiles.map(\.createdAt) == [profileB.createdAt, profileA.createdAt])
+        #expect(settings.profiles.map(\.autoActivate) == [true, true])
+        #expect(settings.activeProfileID == profileB.id)
+        #expect(settings.reconcileDisplayReferences(using: snapshot).isEmpty)
+        #expect(settings.findAutoActivateProfile(
+            forRuntimeDisplayID: 20,
+            snapshot: snapshot
+        )?.id == profileB.id)
+
+        let persistedProfiles = try JSONDecoder().decode(
+            [DockProfile].self,
+            from: defaults.data(forKey: "dockProfiles")!
+        )
+        #expect(persistedProfiles == settings.profiles)
+        #expect(defaults.string(forKey: "activeProfileID") == profileB.id.uuidString)
+
+        let persistedAnchor = DisplayAnchorResolver.resolve(
+            preferredReference: settings.selectedDisplayUUID,
+            fallbackRuntimeID: 10,
+            snapshot: snapshot,
+            excludingInferredReferences: settings.nonPersistentDisplayReferences
+        )
+        #expect(!persistedAnchor.usesFallback)
+        #expect(persistedAnchor.effectiveRuntimeID == 20)
+        #expect(persistedAnchor.permitsAutomaticRelocation)
+        #expect(defaults.string(forKey: "selectedDisplayUUID") == bID)
+    }
+
     @Test("canonical identity syntax is closed and strictly validated")
     func malformedCanonicalLookingReferencesStayUnresolved() {
         let validSnapshot = DisplayReconciler.reconcile(

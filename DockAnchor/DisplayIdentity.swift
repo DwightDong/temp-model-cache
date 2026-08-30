@@ -1491,6 +1491,23 @@ enum DisplayReconciler {
     ) -> MetadataResult {
         var assignments = Array(repeating: [String: Int](), count: runtimes.count)
         let sourceGroups = Dictionary(grouping: metadata.indices, by: { metadata[$0].source })
+        let reconciledCurrentSerials = reconcileCurrentSerialEvidence(
+            runtimes: runtimes,
+            metadata: metadata,
+            invalidSerialKeys: invalidSerialKeys
+        )
+
+        // Reconcile scoped serial identities across the whole snapshot before
+        // committing any per-source metadata assignment. A weak UUID match in
+        // one source is provisional: another source can expose the same serial
+        // with enough one-to-one evidence to prove that the UUID is stale. By
+        // seeding every source matcher with the forced global serial assignment,
+        // such a record is reconsidered against the stronger physical evidence
+        // rather than being permanently attached to the first UUID owner.
+        //
+        // `reconcileCurrentSerialEvidence` uses only hardware model, scoped
+        // serial, and UUID evidence. Runtime IDs, source/order, names, and other
+        // presentation properties do not participate.
 
         // A source can establish evidence needed to associate a record in a
         // different source. For example, UUID-bearing IOKit records can teach
@@ -1513,6 +1530,7 @@ enum DisplayReconciler {
                 runtimes: runtimes,
                 metadata: metadata,
                 assignments: assignments,
+                reconciledCurrentSerials: reconciledCurrentSerials,
                 invalidSerialKeys: invalidSerialKeys
             )
             let evidence = includePriorIdentityEvidence
@@ -1606,6 +1624,7 @@ enum DisplayReconciler {
             runtimes: runtimes,
             metadata: metadata,
             assignments: assignments,
+            reconciledCurrentSerials: reconciledCurrentSerials,
             invalidSerialKeys: invalidSerialKeys
         )
         return MetadataResult(
@@ -1618,14 +1637,19 @@ enum DisplayReconciler {
         runtimes: [DisplayRuntimeObservation],
         metadata: [DisplayMetadataObservation],
         assignments: [[String: Int]],
+        reconciledCurrentSerials: [DisplayHardwareKey?],
         invalidSerialKeys: Set<DisplayHardwareKey>
     ) -> [RuntimeMetadataEvidence] {
-        runtimes.indices.map { runtimeIndex in
+        let currentRuntimeAliases = Set(runtimes.compactMap {
+            $0.uuidAlias.flatMap(DisplayReference.normalizedUUIDAlias)
+        })
+        return runtimes.indices.map { runtimeIndex in
             let runtime = runtimes[runtimeIndex]
-            var aliases = Set(
-                runtime.uuidAlias.flatMap(DisplayReference.normalizedUUIDAlias).map { [$0] } ?? []
+            let runtimeAlias = runtime.uuidAlias.flatMap(DisplayReference.normalizedUUIDAlias)
+            var aliases = Set(runtimeAlias.map { [$0] } ?? [])
+            var serials = Set(
+                reconciledCurrentSerials[runtimeIndex].map { [$0] } ?? []
             )
-            var serials = Set<DisplayHardwareKey>()
             if let key = serialKey(
                 vendorID: runtime.vendorID,
                 productID: runtime.productID,
@@ -1636,7 +1660,13 @@ enum DisplayReconciler {
 
             for metadataIndex in assignments[runtimeIndex].values {
                 let record = metadata[metadataIndex]
-                if let alias = record.uuidAlias.flatMap(DisplayReference.normalizedUUIDAlias) {
+                if let alias = record.uuidAlias.flatMap(DisplayReference.normalizedUUIDAlias),
+                   alias == runtimeAlias || !currentRuntimeAliases.contains(alias) {
+                    // A metadata UUID currently exposed by another runtime is a
+                    // stale port alias once serial reconciliation assigns this
+                    // record elsewhere. Keep it for presentation, but never let
+                    // it contaminate current alias evidence or persistent
+                    // ownership for the physical display.
                     aliases.insert(alias)
                 }
                 if let key = serialKey(
@@ -1652,6 +1682,123 @@ enum DisplayReconciler {
                 serialKey: serials.count == 1 ? serials.first : nil,
                 aliases: aliases
             )
+        }
+    }
+
+    /// Finds serial-to-runtime assignments forced by the complete current
+    /// snapshot. Metadata sources are clustered by scoped serial before any
+    /// source gets to claim a runtime through its UUID. This is the transitive
+    /// step which lets a complete serial-bearing source correct a stale UUID in
+    /// an overlapping partial source.
+    private static func reconcileCurrentSerialEvidence(
+        runtimes: [DisplayRuntimeObservation],
+        metadata: [DisplayMetadataObservation],
+        invalidSerialKeys: Set<DisplayHardwareKey>
+    ) -> [DisplayHardwareKey?] {
+        guard !runtimes.isEmpty else { return [] }
+
+        let serialKeys = Set(
+            runtimes.compactMap {
+                serialKey(
+                    vendorID: $0.vendorID,
+                    productID: $0.productID,
+                    serialNumber: $0.serialNumber
+                )
+            } + metadata.compactMap {
+                serialKey(
+                    vendorID: $0.vendorID,
+                    productID: $0.productID,
+                    serialNumber: $0.serialNumber
+                )
+            }
+        ).subtracting(invalidSerialKeys).sorted()
+        guard !serialKeys.isEmpty else {
+            return Array(repeating: nil, count: runtimes.count)
+        }
+
+        // All aliases observed for the same scoped serial describe one physical
+        // candidate. They are deliberately considered together. In particular,
+        // one stale alias cannot make a partial record win when the other serial
+        // clusters permit one globally stronger one-to-one assignment.
+        var aliasesBySerial: [DisplayHardwareKey: Set<String>] = [:]
+        for record in metadata {
+            guard let key = serialKey(
+                vendorID: record.vendorID,
+                productID: record.productID,
+                serialNumber: record.serialNumber
+            ), !invalidSerialKeys.contains(key),
+               let alias = record.uuidAlias.flatMap(DisplayReference.normalizedUUIDAlias) else {
+                continue
+            }
+            aliasesBySerial[key, default: []].insert(alias)
+        }
+
+        var edges: [MatchEdge] = []
+        for runtimeIndex in runtimes.indices {
+            let runtime = runtimes[runtimeIndex]
+            let observedRuntimeSerial = serialKey(
+                vendorID: runtime.vendorID,
+                productID: runtime.productID,
+                serialNumber: runtime.serialNumber
+            ).flatMap { invalidSerialKeys.contains($0) ? nil : $0 }
+            let runtimeAlias = runtime.uuidAlias.flatMap(DisplayReference.normalizedUUIDAlias)
+
+            for serialIndex in serialKeys.indices {
+                let key = serialKeys[serialIndex]
+                guard modelsCompatible(
+                    lhsVendor: runtime.vendorID,
+                    lhsProduct: runtime.productID,
+                    rhsVendor: key.vendorID,
+                    rhsProduct: key.productID
+                ) else { continue }
+
+                if let observedRuntimeSerial {
+                    // A valid serial observed directly for this runtime is the
+                    // strongest current evidence and rules out every other key.
+                    if observedRuntimeSerial == key {
+                        edges.append(MatchEdge(
+                            left: runtimeIndex,
+                            right: serialIndex,
+                            strength: 3
+                        ))
+                    }
+                    continue
+                }
+
+                if let runtimeAlias,
+                   aliasesBySerial[key, default: []].contains(runtimeAlias) {
+                    edges.append(MatchEdge(
+                        left: runtimeIndex,
+                        right: serialIndex,
+                        strength: 2
+                    ))
+                } else if sameKnownModel(
+                    lhsVendor: runtime.vendorID,
+                    lhsProduct: runtime.productID,
+                    rhsVendor: key.vendorID,
+                    rhsProduct: key.productID
+                ) {
+                    edges.append(MatchEdge(
+                        left: runtimeIndex,
+                        right: serialIndex,
+                        strength: 1
+                    ))
+                }
+            }
+        }
+
+        let possibilities = MaximumWeightMatcher.possibilities(
+            leftCount: runtimes.count,
+            rightCount: serialKeys.count,
+            edges: edges
+        )
+        return runtimes.indices.map { runtimeIndex -> DisplayHardwareKey? in
+            guard possibilities.possibleRightsByLeft[runtimeIndex].count == 1,
+                  !possibilities.nilPossibleByLeft[runtimeIndex],
+                  let serialIndex = possibilities.possibleRightsByLeft[runtimeIndex].first else {
+                return nil
+            }
+            return serialKeys[serialIndex]
         }
     }
 
