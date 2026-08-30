@@ -1064,10 +1064,15 @@ class DockMonitor: NSObject, ObservableObject {
                     }
                     let resolution = stringValue(display["_spdisplays_resolution"])
                         ?? stringValue(display["spdisplays_resolution"])
-                    let baseID = [
-                        uuidAlias ?? "", String(vendor), String(product), String(serial ?? 0),
-                        name ?? "", type ?? "", resolution ?? ""
-                    ].joined(separator: "|")
+                    var identityComponents: [String] = []
+                    identityComponents.append(uuidAlias ?? "")
+                    identityComponents.append(String(vendor))
+                    identityComponents.append(String(product))
+                    identityComponents.append(String(serial ?? 0))
+                    identityComponents.append(name ?? "")
+                    identityComponents.append(type ?? "")
+                    identityComponents.append(resolution ?? "")
+                    let baseID = identityComponents.joined(separator: "|")
                     rawRecords.append((
                         baseID: baseID,
                         observation: DisplayMetadataObservation(
