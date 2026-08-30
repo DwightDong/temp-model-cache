@@ -1518,13 +1518,14 @@ enum DisplayReconciler {
         // point. Assignments are applied simultaneously per round so source
         // names and input ordering cannot influence the result.
         //
-        // Current-snapshot evidence is exhausted first because a newly observed
-        // serial must outrank a historical UUID alias. Once no current source can
-        // make progress, one-to-one prior-identity assignments may contribute an
-        // established serial. This preserves names and presentation metadata
-        // when current serial-bearing APIs are temporarily unavailable without
-        // turning a stale UUID into stronger evidence than a current serial.
-        var includePriorIdentityEvidence = false
+        // Established identity evidence must participate before any weak
+        // per-source UUID assignment becomes final. Otherwise two partial
+        // sources can each attach the same physical display's metadata to
+        // different runtimes and the later registry pass cannot repair the
+        // already-committed presentation records. Current scoped serial evidence
+        // remains authoritative: `incorporatingPriorIdentityEvidence` can add a
+        // prior serial only through a forced one-to-one identity assignment and
+        // never overrides a different valid serial observed in this snapshot.
         while true {
             let currentEvidence = runtimeMetadataEvidence(
                 runtimes: runtimes,
@@ -1533,14 +1534,12 @@ enum DisplayReconciler {
                 reconciledCurrentSerials: reconciledCurrentSerials,
                 invalidSerialKeys: invalidSerialKeys
             )
-            let evidence = includePriorIdentityEvidence
-                ? incorporatingPriorIdentityEvidence(
-                    runtimes: runtimes,
-                    currentEvidence: currentEvidence,
-                    priorRecords: priorRecords,
-                    invalidSerialKeys: invalidSerialKeys
-                )
-                : currentEvidence
+            let evidence = incorporatingPriorIdentityEvidence(
+                runtimes: runtimes,
+                currentEvidence: currentEvidence,
+                priorRecords: priorRecords,
+                invalidSerialKeys: invalidSerialKeys
+            )
             var additions: [(runtimeIndex: Int, source: String, metadataIndex: Int)] = []
 
             for source in sourceGroups.keys.sorted() {
@@ -1602,13 +1601,7 @@ enum DisplayReconciler {
                 }
             }
 
-            if additions.isEmpty {
-                if !includePriorIdentityEvidence && !priorRecords.isEmpty {
-                    includePriorIdentityEvidence = true
-                    continue
-                }
-                break
-            }
+            if additions.isEmpty { break }
             for addition in additions.sorted(by: {
                 if $0.source != $1.source { return $0.source < $1.source }
                 if $0.runtimeIndex != $1.runtimeIndex {
@@ -2031,10 +2024,39 @@ enum DisplayReconciler {
         let aliasClaims = metadataAliases.reduce(into: [String: Int]()) { counts, aliases in
             for alias in aliases { counts[alias, default: 0] += 1 }
         }
+        var priorOwnersByAlias: [String: Set<Int>] = [:]
+        for recordIndex in prior.records.indices {
+            let record = prior.records[recordIndex]
+            for alias in record.uuidAliases {
+                priorOwnersByAlias[alias, default: []].insert(recordIndex)
+            }
+            for reference in record.legacyReferences {
+                let parsed = DisplayReference.parse(reference)
+                if parsed.kind == .bareUUID,
+                   let alias = parsed.uuidAlias.flatMap(DisplayReference.normalizedUUIDAlias) {
+                    priorOwnersByAlias[alias, default: []].insert(recordIndex)
+                }
+            }
+        }
+
         var canonicalClaimByAlias: [String: String] = [:]
         for index in runtimes.indices where resolution[index] == .unique {
             guard let canonicalID = canonicalByRuntime[index] else { continue }
+            let runtimeAlias = runtimes[index].uuidAlias
+                .flatMap(DisplayReference.normalizedUUIDAlias)
             for alias in metadataAliases[index] where aliasClaims[alias] == 1 {
+                if alias != runtimeAlias {
+                    // A metadata-only UUID can outlive the physical display it
+                    // described. It may supplement an unowned identity, or the
+                    // same established identity which already owns it, but it
+                    // cannot transfer history from a disconnected record. Only
+                    // a UUID exposed by the current runtime is authoritative
+                    // enough to perform the atomic port-alias transfer below.
+                    let priorOwners = priorOwnersByAlias[alias, default: []]
+                    guard priorOwners.isEmpty ||
+                            (assignedPriorByRuntime[index].map { priorOwners == Set([$0]) } ?? false)
+                    else { continue }
+                }
                 canonicalClaimByAlias[alias] = canonicalID
             }
         }

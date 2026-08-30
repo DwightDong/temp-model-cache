@@ -120,6 +120,31 @@ private func reconcileEveryPermutation(
     return snapshots[0]
 }
 
+/// Permutes the merged metadata input as well as each runtime observation. Most
+/// fixtures use `reconcileEveryPermutation` to model independently unordered
+/// source collections. This variant is useful for small cross-source regressions
+/// where the order in which source snapshots are merged must also be explicit.
+@discardableResult
+private func reconcileEveryMergedInputPermutation(
+    runtimes: [DisplayRuntimeObservation],
+    metadata: [DisplayMetadataObservation],
+    prior: DisplayIdentityRegistry = DisplayIdentityRegistry(),
+    validate: (DisplayReconciliationSnapshot) -> Void = { _ in }
+) -> DisplayReconciliationSnapshot {
+    let snapshots = permutations(runtimes).flatMap { runtimeOrder in
+        permutations(metadata).map { metadataOrder in
+            DisplayReconciler.reconcile(
+                runtimes: runtimeOrder,
+                metadata: metadataOrder,
+                priorRegistry: prior
+            )
+        }
+    }
+    #expect(Set(snapshots.map(snapshotSignature)).count == 1)
+    snapshots.forEach(validate)
+    return snapshots[0]
+}
+
 private func canonicalBySerial(
     _ serial: UInt32,
     in snapshot: DisplayReconciliationSnapshot
@@ -2341,6 +2366,176 @@ struct DisplayIdentityReconciliationTests {
         #expect(persistedAnchor.effectiveRuntimeID == 20)
         #expect(persistedAnchor.permitsAutomaticRelocation)
         #expect(defaults.string(forKey: "selectedDisplayUUID") == bID)
+    }
+
+    @Test("established identities resolve tied aliases before metadata is committed")
+    func priorIdentityEvidencePrecedesPartialMetadataAssignments() {
+        let established = reconcileEveryPermutation(
+            runtimes: [
+                runtime(1, uuidA, serial: 111),
+                runtime(2, uuidB, serial: 222)
+            ],
+            metadata: [
+                metadata("iokit", "established-a", uuidA, serial: 111),
+                metadata("iokit", "established-b", uuidB, serial: 222)
+            ]
+        )
+        let aID = canonicalBySerial(111, in: established)!
+        let bID = canonicalBySerial(222, in: established)!
+
+        // Both current runtimes temporarily lose their serials. Two partial
+        // metadata sources report B's serial, but one still carries A's port
+        // UUID. Current serial clustering alone is tied because the serial has
+        // both aliases. A/B's established aliases and scoped serial identities
+        // must be incorporated before either weak per-source UUID assignment is
+        // committed, so both records follow physical B.
+        let recovered = reconcileEveryMergedInputPermutation(
+            runtimes: [
+                runtime(30, uuidA, serial: nil),
+                runtime(40, uuidB, serial: nil)
+            ],
+            metadata: [
+                metadata("iokit", "b-under-stale-a", uuidA, serial: 222,
+                         name: "Physical Monitor B", priority: 10),
+                metadata("profiler", "b-under-current-b", uuidB, serial: 222,
+                         name: "Physical Monitor B", priority: 100)
+            ],
+            prior: established.registry,
+            validate: { candidate in
+                let a = candidate.display(runtimeID: 30)
+                let b = candidate.display(runtimeID: 40)
+                #expect(a?.resolution == .unique)
+                #expect(b?.resolution == .unique)
+                #expect(a?.identity?.canonicalID == aID)
+                #expect(b?.identity?.canonicalID == bID)
+                #expect(a?.identity?.serialNumber == 111)
+                #expect(b?.identity?.serialNumber == 222)
+                #expect(a?.metadataAssignments.isEmpty == true)
+                #expect(a?.friendlyName == nil)
+                #expect(b?.metadataAssignments == [
+                    "iokit": "b-under-stale-a",
+                    "profiler": "b-under-current-b"
+                ])
+                #expect(b?.friendlyName == "Physical Monitor B")
+                #expect(candidate.resolve(aID) ==
+                    .resolved(runtimeID: 30, canonicalReference: aID))
+                #expect(candidate.resolve(bID) ==
+                    .resolved(runtimeID: 40, canonicalReference: bID))
+                #expect(DisplayProfileMatcher.uniqueMatch(
+                    for: 40,
+                    references: [bID, aID],
+                    enabled: [true, true],
+                    snapshot: candidate
+                ) == 0)
+            }
+        )
+
+        let anchor = DisplayAnchorResolver.resolve(
+            preferredReference: bID,
+            fallbackRuntimeID: 30,
+            snapshot: recovered
+        )
+        #expect(!anchor.usesFallback)
+        #expect(anchor.effectiveRuntimeID == 40)
+        #expect(anchor.permitsAutomaticRelocation)
+    }
+
+    @Test("metadata-only UUIDs cannot steal disconnected alias history")
+    func staleMetadataAliasPreservesDisconnectedOwner() {
+        let established = reconcileEveryPermutation(
+            runtimes: [
+                runtime(1, uuidA, serial: 111),
+                runtime(2, uuidB, serial: 222)
+            ],
+            metadata: [
+                metadata("iokit", "established-a", uuidA, serial: 111),
+                metadata("iokit", "established-b", uuidB, serial: 222)
+            ]
+        )
+        let aID = canonicalBySerial(111, in: established)!
+        let bID = canonicalBySerial(222, in: established)!
+        let registryWithLegacyHistory = established.registry.recordingLegacyReferences([
+            uuidA: aID
+        ])
+
+        // A disconnects. B moves to UUID-C, while two metadata APIs describe B:
+        // one has the current UUID and a stale profiler record still carries
+        // disconnected A's UUID. The stale metadata alias may be used to attach
+        // the record through SN222, but it must not transfer UUID-A's durable
+        // ownership or bare-UUID availability from A to B.
+        let disconnected = reconcileEveryMergedInputPermutation(
+            runtimes: [runtime(20, uuidC, serial: 222)],
+            metadata: [
+                metadata("iokit", "current-b", uuidC, serial: 222,
+                         name: "Physical Monitor B", priority: 10),
+                metadata("profiler", "stale-a-for-b", uuidA, serial: 222,
+                         name: "Physical Monitor B", priority: 100)
+            ],
+            prior: registryWithLegacyHistory,
+            validate: { candidate in
+                let b = candidate.display(runtimeID: 20)
+                #expect(b?.resolution == .unique)
+                #expect(b?.identity?.canonicalID == bID)
+                #expect(b?.metadataAssignments == [
+                    "iokit": "current-b",
+                    "profiler": "stale-a-for-b"
+                ])
+                #expect(b?.friendlyName == "Physical Monitor B")
+
+                let aRecord = candidate.registry.records.first { $0.canonicalID == aID }
+                let bRecord = candidate.registry.records.first { $0.canonicalID == bID }
+                #expect(aRecord?.uuidAliases.contains(uuidA) == true)
+                #expect(aRecord?.legacyReferences.contains(uuidA) == true)
+                #expect(bRecord?.uuidAliases.contains(uuidA) == false)
+                #expect(bRecord?.legacyReferences.contains(uuidA) == false)
+                #expect(bRecord?.uuidAliases.contains(uuidB) == true)
+                #expect(bRecord?.uuidAliases.contains(uuidC) == true)
+                #expect(candidate.resolve(uuidA) == .unavailable)
+                #expect(candidate.resolve(aID) == .unavailable)
+                #expect(candidate.resolve(bID) ==
+                    .resolved(runtimeID: 20, canonicalReference: bID))
+            }
+        )
+
+        // If A later returns without a serial, the preserved UUID-A history must
+        // restore A rather than identify it as B. Reordering the runtimes cannot
+        // affect either identity, anchor restoration, or profile discrimination.
+        reconcileEveryPermutation(
+            runtimes: [
+                runtime(300, uuidA, serial: nil),
+                runtime(400, uuidC, serial: 222)
+            ],
+            metadata: [],
+            prior: disconnected.registry,
+            validate: { candidate in
+                let a = candidate.display(runtimeID: 300)
+                let b = candidate.display(runtimeID: 400)
+                #expect(a?.resolution == .unique)
+                #expect(b?.resolution == .unique)
+                #expect(a?.identity?.canonicalID == aID)
+                #expect(b?.identity?.canonicalID == bID)
+                #expect(candidate.resolve(uuidA) ==
+                    .resolved(runtimeID: 300, canonicalReference: aID))
+                #expect(candidate.resolve(aID) ==
+                    .resolved(runtimeID: 300, canonicalReference: aID))
+                #expect(candidate.resolve(bID) ==
+                    .resolved(runtimeID: 400, canonicalReference: bID))
+
+                let anchor = DisplayAnchorResolver.resolve(
+                    preferredReference: aID,
+                    fallbackRuntimeID: 400,
+                    snapshot: candidate
+                )
+                #expect(!anchor.usesFallback)
+                #expect(anchor.effectiveRuntimeID == 300)
+                #expect(DisplayProfileMatcher.uniqueMatch(
+                    for: 300,
+                    references: [bID, aID],
+                    enabled: [true, true],
+                    snapshot: candidate
+                ) == 1)
+            }
+        )
     }
 
     @Test("canonical identity syntax is closed and strictly validated")
