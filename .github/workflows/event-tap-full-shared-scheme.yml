@@ -1,0 +1,57 @@
+name: DockAnchor full shared-scheme verification
+
+on:
+  push:
+    branches: ['verification/event-tap-full-scheme']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  full-scheme:
+    runs-on: macos-15
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: candidate/dockanchor-2d1dfee
+      - name: Verify exact candidate and environment
+        run: |
+          set -euxo pipefail
+          test "$(git rev-parse HEAD)" = "2d1dfee186039d02cebaa26a8eb47dadc40b3463"
+          test -z "$(git status --porcelain)"
+          sw_vers
+          uname -a
+          sudo xcode-select -s /Applications/Xcode_16.4.app/Contents/Developer
+          xcodebuild -version
+      - name: Run complete shared scheme
+        run: |
+          set -o pipefail
+          xcodebuild test \
+            -project DockAnchor.xcodeproj \
+            -scheme DockAnchor \
+            -destination 'platform=macOS' \
+            -configuration Debug \
+            -resultBundlePath "$RUNNER_TEMP/DockAnchor-Full-Shared.xcresult" \
+            CODE_SIGN_IDENTITY="-" \
+            CODE_SIGNING_REQUIRED=NO \
+            2>&1 | tee "$RUNNER_TEMP/DockAnchor-Full-Shared.log"
+      - name: Capture summary
+        if: always()
+        run: |
+          xcrun xcresulttool get test-results summary \
+            --path "$RUNNER_TEMP/DockAnchor-Full-Shared.xcresult" \
+            > "$RUNNER_TEMP/DockAnchor-Full-Shared-summary.json" || true
+          cat "$RUNNER_TEMP/DockAnchor-Full-Shared-summary.json" || true
+      - name: Upload evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: DockAnchor-full-shared-scheme
+          if-no-files-found: error
+          retention-days: 7
+          path: |
+            ${{ runner.temp }}/DockAnchor-Full-Shared.log
+            ${{ runner.temp }}/DockAnchor-Full-Shared.xcresult
+            ${{ runner.temp }}/DockAnchor-Full-Shared-summary.json
