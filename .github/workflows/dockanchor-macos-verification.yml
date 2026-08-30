@@ -1,0 +1,73 @@
+name: DockAnchor macOS verification
+
+on:
+  push:
+    branches: ['verification/dockanchor-62bb80e']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Xcode build and complete tests
+    runs-on: macos-15
+    timeout-minutes: 30
+    steps:
+      - name: Checkout candidate
+        uses: actions/checkout@v4
+
+      - name: Capture macOS and Xcode environment
+        run: |
+          set -euxo pipefail
+          sw_vers
+          uname -a
+          echo "Available Xcode installations:"
+          find /Applications -maxdepth 1 -type d -name 'Xcode*.app' -print | sort
+          if [ -d /Applications/Xcode_16.4.app ]; then
+            sudo xcode-select -s /Applications/Xcode_16.4.app/Contents/Developer
+          elif [ -d /Applications/Xcode_16.app ]; then
+            sudo xcode-select -s /Applications/Xcode_16.app/Contents/Developer
+          fi
+          xcode-select -p
+          xcodebuild -version
+
+      - name: Run DockAnchor shared scheme
+        id: test
+        run: |
+          set -o pipefail
+          xcodebuild test \
+            -project DockAnchor.xcodeproj \
+            -scheme DockAnchor \
+            -destination 'platform=macOS' \
+            -configuration Debug \
+            -resultBundlePath "$RUNNER_TEMP/DockAnchorTests.xcresult" \
+            CODE_SIGN_IDENTITY="-" \
+            CODE_SIGNING_REQUIRED=NO \
+            2>&1 | tee "$RUNNER_TEMP/xcodebuild.log"
+
+      - name: Capture complete test summary
+        if: always()
+        run: |
+          set +e
+          echo '=== xcodebuild test summary ==='
+          grep -E 'Test Suite|Test Case|Executed |Testing (started|failed|cancelled|succeeded)|\*\* TEST' "$RUNNER_TEMP/xcodebuild.log" || true
+          if [ -d "$RUNNER_TEMP/DockAnchorTests.xcresult" ]; then
+            echo '=== xcresult test-results summary ==='
+            xcrun xcresulttool get test-results summary \
+              --path "$RUNNER_TEMP/DockAnchorTests.xcresult" || \
+            xcrun xcresulttool get --legacy --format json \
+              --path "$RUNNER_TEMP/DockAnchorTests.xcresult" > "$RUNNER_TEMP/xcresult.json"
+          fi
+
+      - name: Upload verification artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: DockAnchor-macOS-verification
+          if-no-files-found: warn
+          retention-days: 7
+          path: |
+            ${{ runner.temp }}/xcodebuild.log
+            ${{ runner.temp }}/DockAnchorTests.xcresult
+            ${{ runner.temp }}/xcresult.json
