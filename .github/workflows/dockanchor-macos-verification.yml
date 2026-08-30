@@ -14,8 +14,13 @@ jobs:
     runs-on: macos-15
     timeout-minutes: 30
     steps:
-      - name: Checkout candidate
+      - name: Checkout exact candidate
         uses: actions/checkout@v4
+        with:
+          ref: candidate/dockanchor-11d39e3
+
+      - name: Verify candidate revision
+        run: test "$(git rev-parse HEAD)" = "11d39e31e1ba3f4908e7202c6d0b10f168192ea3"
 
       - name: Capture macOS and Xcode environment
         run: |
